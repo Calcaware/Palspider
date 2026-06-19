@@ -1,0 +1,29 @@
+[data-bs-theme="dark"] {
+  --bs-body-bg: #0a0a0a;
+}
+
+[data-bs-theme="light"] {
+  --bs-primary: #115511;
+  --bs-primary-rgb: 17, 85, 17;
+  --bs-link-color: #115511;
+  --bs-link-color-rgb: 17, 85, 17;
+  --bs-success: #115511;
+  --bs-success-rgb: 17, 85, 17;
+}
+
+[data-bs-theme="dark"] {
+  --bs-primary: #66aa66;
+  --bs-primary-rgb: 102, 170, 102;
+  --bs-link-color: #66aa66;
+  --bs-link-color-rgb: 102, 170, 102;
+  --bs-success: #66aa66;
+  --bs-success-rgb: 102, 170, 102;
+}
+
+.form-control:focus {
+  box-shadow: 0 0 0 0.2rem rgba(var(--bs-primary-rgb), 0.25);
+}
+.list-group {
+  position: absolute;
+  z-index: 1000;
+}
