@@ -7,9 +7,9 @@ import (
 )
 
 type Node struct {
-	segment string
-	docIDs  map[int]struct{}
-	mu      sync.RWMutex
+	segment  string
+	docIDs   map[int]struct{}
+	mu       sync.RWMutex
 	children map[string]*Node
 }
 
@@ -33,7 +33,7 @@ func (t *Trie) Insert(rawURL string, docID int) {
 	if err != nil {
 		return
 	}
-	segs := segments(u.Path)
+	segs := keySegments(u)
 
 	t.mu.Lock()
 	node := t.root
@@ -60,19 +60,18 @@ func (t *Trie) GetDocIDsUnder(rawURL string) map[int]struct{} {
 	if err != nil {
 		return nil
 	}
-	segs := segments(u.Path)
 
 	t.mu.RLock()
+	defer t.mu.RUnlock()
+
 	node := t.root
-	for _, seg := range segs {
+	for _, seg := range keySegments(u) {
 		child, ok := node.children[seg]
 		if !ok {
-			t.mu.RUnlock()
 			return nil
 		}
 		node = child
 	}
-	t.mu.RUnlock()
 
 	result := make(map[int]struct{})
 	collect(node, result)
@@ -87,6 +86,17 @@ func (t *Trie) Depth(rawURL string) int {
 	return len(segments(u.Path))
 }
 
+// keySegments scopes trie entries by host so identical paths on different
+// websites are not counted as siblings. The trie lock must be held for any
+// walk that continues into collect.
+func keySegments(u *url.URL) []string {
+	segs := make([]string, 0, len(segments(u.Path))+1)
+	if u.Host != "" {
+		segs = append(segs, strings.ToLower(u.Host))
+	}
+	return append(segs, segments(u.Path)...)
+}
+
 func segments(path string) []string {
 	parts := strings.Split(path, "/")
 	var out []string
@@ -98,6 +108,7 @@ func segments(path string) []string {
 	return out
 }
 
+// collect reads children maps and must only be called while t.mu is held.
 func collect(n *Node, result map[int]struct{}) {
 	n.mu.RLock()
 	for id := range n.docIDs {

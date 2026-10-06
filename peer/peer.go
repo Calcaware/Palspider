@@ -3,6 +3,7 @@ package peer
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/url"
 	"sync"
@@ -24,27 +25,39 @@ type PeerSearchResult struct {
 }
 
 type PeerManager struct {
-	mu     sync.RWMutex
-	peers  map[string]*Peer
-	client *http.Client
+	mu        sync.RWMutex
+	peers     map[string]*Peer
+	gossiping map[string]bool
+	client    *http.Client
 }
 
 func New() *PeerManager {
 	return &PeerManager{
-		peers:  make(map[string]*Peer),
-		client: &http.Client{Timeout: 10 * time.Second},
+		peers:     make(map[string]*Peer),
+		gossiping: make(map[string]bool),
+		client:    &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
-func (pm *PeerManager) Add(peerURL string) error {
+// normalizePeerURL reduces a peer address to scheme://host[:port] so that
+// adds and removes of equivalent URLs match. Only http and https peers are
+// accepted.
+func normalizePeerURL(peerURL string) (string, error) {
 	u, err := url.Parse(peerURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("invalid URL")
+		return "", fmt.Errorf("invalid URL")
 	}
-
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("peer URL must use http or https")
+	}
 	normalized := u.Scheme + "://" + u.Host
-	if u.Port() != "" {
-		normalized += ":" + u.Port()
+	return normalized, nil
+}
+
+func (pm *PeerManager) Add(peerURL string) error {
+	normalized, err := normalizePeerURL(peerURL)
+	if err != nil {
+		return err
 	}
 
 	pm.mu.RLock()
@@ -60,12 +73,13 @@ func (pm *PeerManager) Add(peerURL string) error {
 
 	pm.mu.Lock()
 	pm.peers[normalized] = &Peer{
-		URL:    normalized,
-		Status: "connected",
+		URL:      normalized,
+		Status:   "connected",
+		LastSeen: time.Now().Format(time.RFC3339),
 	}
 	pm.mu.Unlock()
 
-	go pm.gossipFrom(normalized)
+	pm.startGossip(normalized)
 
 	return nil
 }
@@ -93,10 +107,22 @@ func (pm *PeerManager) validate(peerURL string) error {
 	return nil
 }
 
-func (pm *PeerManager) Remove(peerURL string) {
+// Remove drops a peer, matching the same normalization used by Add. It
+// reports whether a peer was actually removed.
+func (pm *PeerManager) Remove(peerURL string) bool {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
-	delete(pm.peers, peerURL)
+	if normalized, err := normalizePeerURL(peerURL); err == nil {
+		if _, ok := pm.peers[normalized]; ok {
+			delete(pm.peers, normalized)
+			return true
+		}
+	}
+	if _, ok := pm.peers[peerURL]; ok {
+		delete(pm.peers, peerURL)
+		return true
+	}
+	return false
 }
 
 func (pm *PeerManager) List() []*Peer {
@@ -104,25 +130,72 @@ func (pm *PeerManager) List() []*Peer {
 	defer pm.mu.RUnlock()
 	list := make([]*Peer, 0, len(pm.peers))
 	for _, p := range pm.peers {
-		list = append(list, p)
+		list = append(list, &Peer{
+			URL:      p.URL,
+			Status:   p.Status,
+			LastSeen: p.LastSeen,
+		})
 	}
 	return list
+}
+
+// markContact records a successful or failed exchange with a peer.
+func (pm *PeerManager) markContact(peerURL string, err error) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	p, ok := pm.peers[peerURL]
+	if !ok {
+		return
+	}
+	p.LastSeen = time.Now().Format(time.RFC3339)
+	if err != nil {
+		p.Status = "unreachable"
+	} else {
+		p.Status = "connected"
+	}
+}
+
+// startGossip launches a one-shot gossip exchange, skipping peers that
+// already have one in flight so a large mesh does not spawn duplicate
+// goroutines for the same target.
+func (pm *PeerManager) startGossip(peerURL string) {
+	pm.mu.Lock()
+	if pm.gossiping[peerURL] {
+		pm.mu.Unlock()
+		return
+	}
+	pm.gossiping[peerURL] = true
+	pm.mu.Unlock()
+
+	go func() {
+		defer func() {
+			pm.mu.Lock()
+			delete(pm.gossiping, peerURL)
+			pm.mu.Unlock()
+		}()
+		pm.gossipFrom(peerURL)
+	}()
 }
 
 func (pm *PeerManager) gossipFrom(peerURL string) {
 	resp, err := pm.client.Get(peerURL + "/api/peers/gossip")
 	if err != nil {
+		pm.markContact(peerURL, err)
 		return
 	}
 	defer resp.Body.Close()
 
 	var remotePeers []*Peer
 	if err := json.NewDecoder(resp.Body).Decode(&remotePeers); err != nil {
+		pm.markContact(peerURL, err)
 		return
 	}
+	pm.markContact(peerURL, nil)
 
 	for _, rp := range remotePeers {
-		pm.Add(rp.URL)
+		if err := pm.Add(rp.URL); err != nil {
+			log.Printf("peer: gossip add %s: %v", rp.URL, err)
+		}
 	}
 }
 
@@ -150,21 +223,26 @@ func (pm *PeerManager) SearchAll(query string, limit int, timeout time.Duration)
 			reqURL := fmt.Sprintf("%s/api/search?q=%s&limit=%d", p.URL, url.QueryEscape(query), limit)
 			resp, err := client.Get(reqURL)
 			if err != nil {
+				pm.markContact(p.URL, err)
 				results[i] = PeerSearchResult{Peer: p.URL, Error: err}
 				return
 			}
 			defer resp.Body.Close()
 
 			if resp.StatusCode != http.StatusOK {
-				results[i] = PeerSearchResult{Peer: p.URL, Error: fmt.Errorf("status %d", resp.StatusCode)}
+				err = fmt.Errorf("status %d", resp.StatusCode)
+				pm.markContact(p.URL, err)
+				results[i] = PeerSearchResult{Peer: p.URL, Error: err}
 				return
 			}
 
 			var peerResults []searcher.Result
 			if err := json.NewDecoder(resp.Body).Decode(&peerResults); err != nil {
+				pm.markContact(p.URL, err)
 				results[i] = PeerSearchResult{Peer: p.URL, Error: err}
 				return
 			}
+			pm.markContact(p.URL, nil)
 
 			for j := range peerResults {
 				peerResults[j].PeerSource = p.URL

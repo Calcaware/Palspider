@@ -48,6 +48,43 @@ func (s *Store) SaveDocument(id int, doc interface{}) error {
 	})
 }
 
+// SaveDocumentBatch writes a document, its postings, dirty link counts, and
+// the next doc ID in a single transaction. Marshalling happens before the
+// transaction opens so the write lock is held as briefly as possible.
+func (s *Store) SaveDocumentBatch(docID int, doc interface{}, nextID int, postings map[string]map[int]int, linkCounts map[string]int) error {
+	docData, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	type kv struct{ key, val []byte }
+	entries := make([]kv, 0, len(postings))
+	for term, p := range postings {
+		data, err := json.Marshal(p)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, kv{[]byte(term), data})
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		if err := tx.Bucket([]byte("docs")).Put(itob(docID), docData); err != nil {
+			return err
+		}
+		index := tx.Bucket([]byte("index"))
+		for _, e := range entries {
+			if err := index.Put(e.key, e.val); err != nil {
+				return err
+			}
+		}
+		links := tx.Bucket([]byte("links"))
+		for u, c := range linkCounts {
+			if err := links.Put([]byte(u), itob(c)); err != nil {
+				return err
+			}
+		}
+		return tx.Bucket([]byte("meta")).Put([]byte("nextDocID"), itob(nextID))
+	})
+}
+
 func (s *Store) AllDocuments(fn func(id int, data []byte) error) error {
 	return s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("docs")).ForEach(func(k, v []byte) error {
@@ -80,6 +117,22 @@ func (s *Store) SaveLinkCount(url string, count int) error {
 	})
 }
 
+// SaveLinkCounts writes several in-degree counts in one transaction.
+func (s *Store) SaveLinkCounts(counts map[string]int) error {
+	if len(counts) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("links"))
+		for u, c := range counts {
+			if err := bucket.Put([]byte(u), itob(c)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Store) AllLinkCounts(fn func(url string, count int) error) error {
 	return s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("links")).ForEach(func(k, v []byte) error {
@@ -91,6 +144,14 @@ func (s *Store) AllLinkCounts(fn func(url string, count int) error) error {
 func (s *Store) MarkVisited(url string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("visited")).Put([]byte(url), []byte{1})
+	})
+}
+
+// DeleteVisited removes a URL from the visited set (used when a seed could
+// not be queued and must be retriable).
+func (s *Store) DeleteVisited(url string) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("visited")).Delete([]byte(url))
 	})
 }
 

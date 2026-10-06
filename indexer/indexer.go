@@ -13,15 +13,17 @@ type Document struct {
 }
 
 type Indexer struct {
-	mu      sync.RWMutex
-	docs    []Document
-	nextID  int
-	index   map[string]map[int]int
+	mu     sync.RWMutex
+	docs   []Document
+	nextID int
+	index  map[string]map[int]int
+	byURL  map[string]int
 }
 
 func New() *Indexer {
 	return &Indexer{
 		index: make(map[string]map[int]int),
+		byURL: make(map[string]int),
 	}
 }
 
@@ -37,6 +39,9 @@ func (ix *Indexer) AddDocument(url, title, text string, terms []string) int {
 		Title: title,
 		Text:  text,
 	})
+	if _, ok := ix.byURL[url]; !ok {
+		ix.byURL[url] = id
+	}
 
 	for _, term := range terms {
 		postings, ok := ix.index[term]
@@ -97,6 +102,31 @@ func (ix *Indexer) AllTerms() []string {
 	return terms
 }
 
+// TermCount returns the vocabulary size without allocating.
+func (ix *Indexer) TermCount() int {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	return len(ix.index)
+}
+
+// WalkTerms iterates the vocabulary under a single read lock, passing each
+// term and its document frequency to fn.
+func (ix *Indexer) WalkTerms(fn func(term string, df int)) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	for t, p := range ix.index {
+		fn(t, len(p))
+	}
+}
+
+// IDForURL reports whether a document with this exact URL is indexed.
+func (ix *Indexer) IDForURL(url string) (int, bool) {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	id, ok := ix.byURL[url]
+	return id, ok
+}
+
 func (ix *Indexer) RestoreDocument(doc Document) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
@@ -106,6 +136,9 @@ func (ix *Indexer) RestoreDocument(doc Document) {
 		ix.docs = newDocs
 	}
 	ix.docs[doc.ID] = doc
+	if _, ok := ix.byURL[doc.URL]; !ok {
+		ix.byURL[doc.URL] = doc.ID
+	}
 	if doc.ID >= ix.nextID {
 		ix.nextID = doc.ID + 1
 	}

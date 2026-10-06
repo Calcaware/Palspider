@@ -3,6 +3,7 @@ package searcher
 import (
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/calcaware/palspider/crawler"
 	"github.com/calcaware/palspider/indexer"
@@ -20,15 +21,21 @@ type Result struct {
 }
 
 type Searcher struct {
-	ix   *indexer.Indexer
-	tr   *trie.Trie
+	ix *indexer.Indexer
+	tr *trie.Trie
 }
 
 func New(ix *indexer.Indexer, tr *trie.Trie) *Searcher {
 	return &Searcher{ix: ix, tr: tr}
 }
 
+// Search ranks indexed documents against the query terms. limit <= 0 returns
+// no results; ties are broken by document ID so repeated searches and
+// paginated requests return a stable order.
 func (s *Searcher) Search(query string, limit int) []Result {
+	if limit <= 0 {
+		return nil
+	}
 	terms := crawler.Tokenize(query)
 	if len(terms) == 0 {
 		return nil
@@ -99,7 +106,11 @@ func (s *Searcher) Search(query string, limit int) []Result {
 	}
 
 	sort.Slice(ranked, func(i, j int) bool {
-		return scores[ranked[i]] > scores[ranked[j]]
+		si, sj := scores[ranked[i]], scores[ranked[j]]
+		if si != sj {
+			return si > sj
+		}
+		return ranked[i] < ranked[j]
 	})
 
 	if limit > len(ranked) {
@@ -124,23 +135,31 @@ func (s *Searcher) Search(query string, limit int) []Result {
 	return results
 }
 
+// Suggest returns up to limit index terms starting with prefix, most common
+// first. The comparison is case-insensitive.
 func (s *Searcher) Suggest(prefix string, limit int) []string {
-	lower := prefix
+	lower := strings.ToLower(strings.TrimSpace(prefix))
+	if lower == "" || limit <= 0 {
+		return []string{}
+	}
+
 	type match struct {
 		term  string
 		count int
 	}
 	var matches []match
 
-	for _, term := range s.ix.AllTerms() {
-		if len(term) >= len(lower) && term[:len(lower)] == lower {
-			postings := s.ix.GetPostings(term)
-			matches = append(matches, match{term, len(postings)})
+	s.ix.WalkTerms(func(term string, df int) {
+		if strings.HasPrefix(term, lower) {
+			matches = append(matches, match{term, df})
 		}
-	}
+	})
 
 	sort.Slice(matches, func(i, j int) bool {
-		return matches[i].count > matches[j].count
+		if matches[i].count != matches[j].count {
+			return matches[i].count > matches[j].count
+		}
+		return matches[i].term < matches[j].term
 	})
 
 	if limit > len(matches) {

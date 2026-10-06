@@ -3,8 +3,8 @@ package indexer
 import "sync"
 
 type LinkStore struct {
-	mu      sync.Mutex
-	counts  map[string]int
+	mu     sync.Mutex
+	counts map[string]int
 }
 
 func NewLinkStore() *LinkStore {
