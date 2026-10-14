@@ -26,8 +26,11 @@ deduplicated by URL, and peer lists gossip automatically.
   proximity weighting, in-degree link weighting, URL-depth bonus, and
   sibling-cluster boost. Query-focused snippets highlight matching terms.
   No models, no embeddings.
-- **Autocomplete** - term suggestions ranked by document frequency,
-  case-insensitive, debounced client-side.
+- **Autocomplete** - suggestions ranked by document frequency, available
+  case-insensitively and debounced client-side. Completes single terms, entire
+  phrases once more than one word has been typed (for example `search eng` ->
+  `search engine`), and surfaces matching host names from the index as domain
+  hints.
 - **Sitemap export** - `GET /sitemap.xml` streams every indexed URL as an XML
   sitemap, optionally scoped to one host and its subdomains with `?host=`.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
@@ -208,7 +211,7 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `GET /search?q=...&page=N` | Results page, 10 per page up to page 10. Redirects to `/` if `q` is empty. |
 | `POST /crawl` | Form field `url` - seed a URL, then redirect to `/?crawl=started` (or `?crawl=invalid`). |
 | `GET /crawl-status` | JSON crawl status (the UI polls this every 3 seconds). |
-| `GET /suggest?q=...&limit=N` | JSON array of term suggestions (default 5, max 20). |
+| `GET /suggest?q=...&limit=N` | JSON array of suggestions (default 5, max 20): term completions, multi-word phrase completions, and host name hints. |
 | anything else | Plain 404 page. |
 
 ### JSON API
@@ -221,7 +224,7 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `GET /api/export?limit=100&offset=0&format=json` | Paginated export of indexed documents (`id`, `url`, `title`, `text`, `linkCount`). `limit` clamps to [1, 1000]; `format=ndjson` streams one document per line. |
 | `GET /api/crawl` | Alias of `GET /crawl-status`. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
-| `GET /api/suggest?q=...&limit=5` | Alias of `GET /suggest`. |
+| `GET /api/suggest?q=...&limit=5` | Alias of `GET /suggest` (term, phrase, and domain hints). |
 | `GET /api/peers` | List registered peers with status and last-seen. |
 | `POST /api/peers` | `{"url":"http://host:3000"}` - validate and add a peer. |
 | `DELETE /api/peers` | `{"url":"..."}` - remove a peer; returns `{"removed":true|false}`. |
@@ -285,7 +288,8 @@ Things that are still wrong or missing after the current round of fixes:
    validation request, and knowledge transitive floods through the mesh. The
    in-flight guard prevents duplicates, not the total volume.
 6. **Autocomplete scans the whole vocabulary** on every keystroke (no term
-   trie yet). The URL trie is a different structure.
+   trie yet), and multi-word or domain-hint suggestions also walk every indexed
+   document. The URL trie is a different structure.
 7. **Dead peers are marked but never removed.** A search may still spend up to
    its 2 s budget waiting on an unreachable peer before falling back to local
    results.

@@ -459,40 +459,106 @@ func (s *Searcher) Related(rawURL string, limit int) []Result {
 	return results
 }
 
-// Suggest returns up to limit index terms starting with prefix, most common
-// first. The comparison is case-insensitive.
+// Suggest returns up to limit suggestions for the given prefix. Suggestions
+// combine vocabulary completions for the last token (most common first),
+// multi-word completions when the caller has already typed more than one word,
+// and domain hints taken from indexed URLs. Comparison is case-insensitive and
+// the result is always a non-nil slice.
 func (s *Searcher) Suggest(prefix string, limit int) []string {
 	lower := strings.ToLower(strings.TrimSpace(prefix))
 	if lower == "" || limit <= 0 {
 		return []string{}
 	}
-
-	type match struct {
-		term  string
-		count int
-	}
-	var matches []match
-
-	s.ix.WalkTerms(func(term string, df int) {
-		if strings.HasPrefix(term, lower) {
-			matches = append(matches, match{term, df})
-		}
-	})
-
-	sort.Slice(matches, func(i, j int) bool {
-		if matches[i].count != matches[j].count {
-			return matches[i].count > matches[j].count
-		}
-		return matches[i].term < matches[j].term
-	})
-
-	if limit > len(matches) {
-		limit = len(matches)
+	terms := crawler.Tokenize(lower)
+	if len(terms) == 0 {
+		return []string{}
 	}
 
+	lastTerm := terms[len(terms)-1]
+	preceding := terms[:len(terms)-1]
+
+	counts := make(map[string]int)
+	var order []string
+	add := func(text string, weight int) {
+		if text == "" {
+			return
+		}
+		if _, ok := counts[text]; !ok {
+			order = append(order, text)
+		}
+		counts[text] += weight
+	}
+
+	if len(preceding) == 0 {
+		// Single word: complete the term from the vocabulary and add hosts
+		// from the index that begin with the same text.
+		s.ix.WalkTerms(func(term string, df int) {
+			if strings.HasPrefix(term, lastTerm) {
+				add(term, df)
+			}
+		})
+		for _, doc := range s.ix.AllDocs() {
+			parsed, err := url.Parse(doc.URL)
+			if err != nil {
+				continue
+			}
+			host := strings.ToLower(strings.Trim(parsed.Hostname(), "."))
+			if host != "" && strings.HasPrefix(host, lastTerm) {
+				add(host, 1)
+			}
+		}
+	} else {
+		// Multiple words: only complete documents that already contain every
+		// preceding term, so "search eng" suggests "search engine" rather
+		// than an unrelated "engine" page.
+		prefixText := strings.Join(preceding, " ")
+		for _, doc := range s.ix.AllDocs() {
+			tokens := crawler.Tokenize(strings.ToLower(doc.Title + " " + doc.Text))
+			if !containsAllTokens(tokens, preceding) {
+				continue
+			}
+			inDoc := make(map[string]struct{})
+			for _, tok := range tokens {
+				if !strings.HasPrefix(tok, lastTerm) {
+					continue
+				}
+				if _, ok := inDoc[tok]; ok {
+					continue
+				}
+				inDoc[tok] = struct{}{}
+				add(prefixText+" "+tok, 1)
+			}
+		}
+	}
+
+	sort.Slice(order, func(i, j int) bool {
+		if counts[order[i]] != counts[order[j]] {
+			return counts[order[i]] > counts[order[j]]
+		}
+		return order[i] < order[j]
+	})
+
+	if limit > len(order) {
+		limit = len(order)
+	}
 	out := make([]string, limit)
-	for i, m := range matches[:limit] {
-		out[i] = m.term
-	}
+	copy(out, order[:limit])
 	return out
+}
+
+// containsAllTokens reports whether every wanted token appears in tokens.
+func containsAllTokens(tokens, wanted []string) bool {
+	if len(wanted) == 0 {
+		return true
+	}
+	present := make(map[string]struct{}, len(tokens))
+	for _, tok := range tokens {
+		present[tok] = struct{}{}
+	}
+	for _, tok := range wanted {
+		if _, ok := present[tok]; !ok {
+			return false
+		}
+	}
+	return true
 }

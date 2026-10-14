@@ -100,8 +100,9 @@ Tasks:
 - [x] Add result highlighting in the web UI.
 - [x] Add host filters and path filters.
 - [x] Add sort order options (relevance, newest, oldest, most linked).
-- [ ] Add search suggestions that include multi-word completions and domain hints.
+- [x] Add search suggestions that include multi-word completions and domain hints.
 - [ ] Add saved search history or bookmarkable searches.
+- [ ] Replace the full-vocabulary autocomplete scan with a prefix trie or cached prefix index.
 
 ### 3.2 Crawl management features
 

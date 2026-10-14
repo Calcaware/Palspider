@@ -173,8 +173,15 @@ func TestSuggest(t *testing.T) {
 	if !strings.HasPrefix(ct, "application/json") {
 		t.Errorf("suggest content-type = %q, want application/json", ct)
 	}
-	if strings.TrimSpace(body) != `["node"]` {
-		t.Errorf("suggest q=Nod body = %s, want [\"node\"]", body)
+	var s []string
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("suggest body: %v", err)
+	}
+	if len(s) == 0 || s[0] != "node" {
+		t.Errorf("suggest q=Nod = %v, want node ranked first", s)
+	}
+	if !contains(s, "nodejs.org") {
+		t.Errorf("suggest q=Nod = %v, want the seeded nodejs.org domain hint", s)
 	}
 	_, ct, _ = get(t, ts.URL+"/suggest")
 	if !strings.HasPrefix(ct, "application/json") {
@@ -193,8 +200,8 @@ func TestSuggestWithLimit(t *testing.T) {
 	if err := json.Unmarshal([]byte(body), &s); err != nil {
 		t.Fatalf("suggest body: %v", err)
 	}
-	if len(s) != 1 || s[0] != "node" {
-		t.Errorf("suggest = %v, want [node]", s)
+	if len(s) != 2 || s[0] != "node" {
+		t.Errorf("suggest = %v, want node first with one domain hint", s)
 	}
 	code, _, body = get(t, ts.URL+"/suggest?q=node&limit=foo")
 	if code != 400 {
@@ -207,6 +214,43 @@ func TestSuggestWithLimit(t *testing.T) {
 	if code != 200 {
 		t.Errorf("short query status = %d, want 200 (returns empty slice)", code)
 	}
+}
+
+func TestSuggestMultiWordAndDomainHints(t *testing.T) {
+	ts, done := newTestServer(t)
+	defer done()
+
+	// Multi-word completion: only pages that already contain "search" can
+	// finish the phrase, so "search eng" should surface "search engine".
+	code, _, body := get(t, ts.URL+"/suggest?q="+url.QueryEscape("search eng"))
+	if code != 200 {
+		t.Fatalf("GET /suggest multi-word status = %d, want 200", code)
+	}
+	var s []string
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("multi-word suggest body: %v", err)
+	}
+	if !contains(s, "search engine") {
+		t.Fatalf("multi-word suggest = %v, want search engine", s)
+	}
+
+	// Domain hint: "node" should suggest the nodejs.org host.
+	_, _, body = get(t, ts.URL+"/suggest?q=node")
+	if err := json.Unmarshal([]byte(body), &s); err != nil {
+		t.Fatalf("domain suggest body: %v", err)
+	}
+	if !contains(s, "nodejs.org") {
+		t.Fatalf("domain suggest = %v, want nodejs.org", s)
+	}
+}
+
+func contains(values []string, want string) bool {
+	for _, v := range values {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPublicRateLimit(t *testing.T) {

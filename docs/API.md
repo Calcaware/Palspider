@@ -326,8 +326,18 @@ worker logs `blocked address` and skips it unless `PALSPIDER_ALLOW_PRIVATE=1`.
 
 ### `GET /api/suggest` and `GET /suggest`
 
-Term autocomplete. Returns JSON array of suggestion strings ranked by
-document frequency, case-insensitive.
+Autocomplete. Returns a JSON array of suggestion strings, case-insensitive.
+There are three kinds of suggestion, all ranked by frequency and returned
+together in one list:
+
+- **Term completions** - vocabulary terms that begin with the typed token,
+  most common first.
+- **Phrase completions** - when more than one word has been typed, only
+  documents that already contain every preceding word contribute, so
+  `search eng` suggests `search engine` rather than an unrelated `engine`
+  document.
+- **Domain hints** - host names from indexed URLs that begin with the typed
+  token.
 
 Query parameters:
 
@@ -339,11 +349,11 @@ Query parameters:
 Example:
 
 ```sh
-curl 'http://localhost:3000/api/suggest?q=nod&limit=3'
+curl 'http://localhost:3000/api/suggest?q=search%20eng&limit=3'
 ```
 
 ```json
-["node", "nodejs", "nonblocking"]
+["search engine", "search engines", "search engine optimization"]
 ```
 
 ### `GET /api/peers`

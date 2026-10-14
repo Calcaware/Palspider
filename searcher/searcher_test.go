@@ -214,3 +214,41 @@ func TestSuggestRanksByFrequencyAndReturnsEmptySlice(t *testing.T) {
 		t.Errorf("Suggest(no match) = %v, want non-nil empty slice", got)
 	}
 }
+
+func TestSuggestIncludesDomainHints(t *testing.T) {
+	s, ix := newSearcher()
+	addDoc(ix, "https://nodejs.org/", "node runtime")
+	addDoc(ix, "https://example.com/", "unrelated text")
+
+	got := s.Suggest("node", 5)
+	if len(got) == 0 || got[0] != "node" {
+		t.Fatalf("Suggest(node) = %v, want node first", got)
+	}
+	found := false
+	for _, v := range got {
+		if v == "nodejs.org" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Suggest(node) = %v, want nodejs.org domain hint", got)
+	}
+}
+
+func TestSuggestCompletesMultiWordPhrases(t *testing.T) {
+	s, ix := newSearcher()
+	addDoc(ix, "https://a.com/1", "search engine optimization guide")
+	addDoc(ix, "https://a.com/2", "unrelated engine repair")
+
+	got := s.Suggest("search eng", 5)
+	if len(got) == 0 || got[0] != "search engine" {
+		t.Fatalf("Suggest(search eng) = %v, want search engine", got)
+	}
+	// The standalone "engine" page must not contribute a suggestion because it
+	// does not contain the preceding term.
+	for _, v := range got {
+		if v == "engine repair" {
+			t.Fatalf("Suggest(search eng) = %v, leaked a suggestion from an unrelated document", got)
+		}
+	}
+}
