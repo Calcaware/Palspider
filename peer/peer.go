@@ -6,6 +6,8 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,6 +31,50 @@ type PeerManager struct {
 	peers     map[string]*Peer
 	gossiping map[string]bool
 	client    *http.Client
+}
+
+func peerAuthHeader() string {
+	v := strings.TrimSpace(os.Getenv("PALSPIDER_PEER_TOKEN"))
+	if v == "" {
+		return ""
+	}
+	return "Bearer " + v
+}
+
+func peerAllowed(peerURL string) bool {
+	allow := strings.TrimSpace(os.Getenv("PALSPIDER_PEER_ALLOWLIST"))
+	if allow == "" {
+		return true
+	}
+	normalized, err := normalizePeerURL(peerURL)
+	if err != nil {
+		normalized = peerURL
+	}
+	host := ""
+	if u, err := url.Parse(normalized); err == nil {
+		host = strings.Trim(strings.ToLower(u.Hostname()), ".")
+	}
+	for _, pattern := range strings.FieldsFunc(allow, func(r rune) bool { return r == ',' || r == ';' || r == '\n' || r == '\r' }) {
+		pattern = strings.TrimSpace(strings.ToLower(pattern))
+		if pattern == "" {
+			continue
+		}
+		pattern = strings.Trim(pattern, ".")
+		if pattern == "*" {
+			return true
+		}
+		if strings.HasPrefix(pattern, "*.") {
+			suffix := strings.TrimPrefix(pattern, "*.")
+			if host == suffix || strings.HasSuffix(host, "."+suffix) {
+				return true
+			}
+			continue
+		}
+		if host == pattern || strings.HasSuffix(host, "."+pattern) {
+			return true
+		}
+	}
+	return false
 }
 
 func New() *PeerManager {
@@ -59,6 +105,9 @@ func (pm *PeerManager) Add(peerURL string) error {
 	if err != nil {
 		return err
 	}
+	if !peerAllowed(normalized) {
+		return fmt.Errorf("peer host not allowed by policy")
+	}
 
 	pm.mu.RLock()
 	_, exists := pm.peers[normalized]
@@ -85,7 +134,14 @@ func (pm *PeerManager) Add(peerURL string) error {
 }
 
 func (pm *PeerManager) validate(peerURL string) error {
-	resp, err := pm.client.Get(peerURL + "/api/status")
+	req, err := http.NewRequest(http.MethodGet, peerURL+"/api/status", nil)
+	if err != nil {
+		return err
+	}
+	if auth := peerAuthHeader(); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := pm.client.Do(req)
 	if err != nil {
 		return err
 	}
@@ -178,7 +234,15 @@ func (pm *PeerManager) startGossip(peerURL string) {
 }
 
 func (pm *PeerManager) gossipFrom(peerURL string) {
-	resp, err := pm.client.Get(peerURL + "/api/peers/gossip")
+	req, err := http.NewRequest(http.MethodGet, peerURL+"/api/peers/gossip", nil)
+	if err != nil {
+		pm.markContact(peerURL, err)
+		return
+	}
+	if auth := peerAuthHeader(); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+	resp, err := pm.client.Do(req)
 	if err != nil {
 		pm.markContact(peerURL, err)
 		return
@@ -221,7 +285,16 @@ func (pm *PeerManager) SearchAll(query string, limit int, timeout time.Duration)
 
 			client := &http.Client{Timeout: timeout}
 			reqURL := fmt.Sprintf("%s/api/search?q=%s&limit=%d", p.URL, url.QueryEscape(query), limit)
-			resp, err := client.Get(reqURL)
+			req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+			if err != nil {
+				pm.markContact(p.URL, err)
+				results[i] = PeerSearchResult{Peer: p.URL, Error: err}
+				return
+			}
+			if auth := peerAuthHeader(); auth != "" {
+				req.Header.Set("Authorization", auth)
+			}
+			resp, err := client.Do(req)
 			if err != nil {
 				pm.markContact(p.URL, err)
 				results[i] = PeerSearchResult{Peer: p.URL, Error: err}

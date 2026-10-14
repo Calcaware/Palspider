@@ -63,3 +63,10 @@ func TestRemoveReportsWhetherPeerExisted(t *testing.T) {
 		t.Error("Remove of unknown peer = true, want false")
 	}
 }
+
+func TestPeerAuthHeader(t *testing.T) {
+	t.Setenv("PALSPIDER_PEER_TOKEN", "secret-token")
+	if got := peerAuthHeader(); got != "Bearer secret-token" {
+		t.Fatalf("peerAuthHeader() = %q, want %q", got, "Bearer secret-token")
+	}
+}

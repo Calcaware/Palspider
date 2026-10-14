@@ -92,6 +92,93 @@ func TestSearchIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestSearchBoostsTitleMatches(t *testing.T) {
+	s, ix := newSearcher()
+	titleDoc := addDoc(ix, "https://example.com/guide", "Golang guide for beginners")
+	bodyDoc := addDoc(ix, "https://example.org/other", "This page talks about golang in the body text but not the title")
+
+	results := s.Search("golang", 10)
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if results[0].ID != titleDoc {
+		t.Fatalf("top result = doc %d, want title-boosted doc %d", results[0].ID, titleDoc)
+	}
+	if results[0].URL == "https://example.org/other" {
+		t.Fatalf("body-only match outranked title match: %#v", results)
+	}
+	if results[1].ID != bodyDoc {
+		t.Fatalf("second result = doc %d, want %d", results[1].ID, bodyDoc)
+	}
+}
+
+func TestSearchPrefersPhraseMatches(t *testing.T) {
+	s, ix := newSearcher()
+	phraseDoc := addDoc(ix, "https://a.com/phrase", "The exact phrase does matter here")
+	otherDoc := addDoc(ix, "https://b.com/other", "This page mentions phrase but not the exact contiguous phrase it does matter")
+
+	results := s.Search("\"phrase does\"", 10)
+	if len(results) != 2 {
+		t.Fatalf("got %d results, want 2", len(results))
+	}
+	if results[0].ID != phraseDoc {
+		t.Fatalf("phrase query should prefer contiguous phrase result; got %#v", results)
+	}
+	if results[1].ID != otherDoc {
+		t.Fatalf("fall-back doc should remain second; got %#v", results)
+	}
+}
+
+func TestSearchSupportsSortOptions(t *testing.T) {
+	s, ix := newSearcher()
+	oldDoc := addDoc(ix, "https://a.com/old", "golang tutorial")
+	newDoc := addDoc(ix, "https://a.com/new", "golang tutorial")
+	linkedDoc := addDoc(ix, "https://a.com/linked", "golang tutorial")
+	ix.SetLinkCount(oldDoc, 1)
+	ix.SetLinkCount(newDoc, 5)
+	ix.SetLinkCount(linkedDoc, 9)
+
+	if got := s.SearchWithSort("golang", 10, "newest"); got[0].ID != linkedDoc || got[1].ID != newDoc || got[2].ID != oldDoc {
+		t.Fatalf("newest order = %#v, want [%d %d %d]", got, linkedDoc, newDoc, oldDoc)
+	}
+	if got := s.SearchWithSort("golang", 10, "oldest"); got[0].ID != oldDoc || got[1].ID != newDoc || got[2].ID != linkedDoc {
+		t.Fatalf("oldest order = %#v, want [%d %d %d]", got, oldDoc, newDoc, linkedDoc)
+	}
+	if got := s.SearchWithSort("golang", 10, "most linked"); got[0].ID != linkedDoc || got[1].ID != newDoc || got[2].ID != oldDoc {
+		t.Fatalf("most linked order = %#v, want [%d %d %d]", got, linkedDoc, newDoc, oldDoc)
+	}
+	if got := s.SearchWithSort("golang", 10, "unknown"); got[0].ID != linkedDoc || got[1].ID != newDoc || got[2].ID != oldDoc {
+		t.Fatalf("default/fallback order = %#v, want relevance order [%d %d %d]", got, linkedDoc, newDoc, oldDoc)
+	}
+}
+
+func TestRelatedRanksDocumentsBySharedTerms(t *testing.T) {
+	s, ix := newSearcher()
+	sourceURL := "https://example.com/source"
+	relatedURL := "https://example.com/related"
+	otherURL := "https://elsewhere.example/other"
+	sourceText := "crawler search indexing ranking"
+	relatedText := "crawler search indexing tools"
+	otherText := "crawler garden vegetables"
+	ix.AddDocument(sourceURL, "Crawler search", sourceText, crawler.Tokenize("Crawler search "+sourceText))
+	ix.AddDocument(relatedURL, "Search indexing", relatedText, crawler.Tokenize("Search indexing "+relatedText))
+	ix.AddDocument(otherURL, "Garden", otherText, crawler.Tokenize("Garden "+otherText))
+
+	results := s.Related(sourceURL, 5)
+	if len(results) != 2 {
+		t.Fatalf("Related() returned %d results, want 2", len(results))
+	}
+	if results[0].URL != relatedURL {
+		t.Fatalf("first related result = %q, want %q", results[0].URL, relatedURL)
+	}
+	if results[0].Score <= results[1].Score {
+		t.Fatalf("related scores are not descending: %v then %v", results[0].Score, results[1].Score)
+	}
+	if got := s.Related("https://missing.example/", 5); len(got) != 0 {
+		t.Fatalf("unknown source returned related results: %#v", got)
+	}
+}
+
 func TestSuggestIsCaseInsensitive(t *testing.T) {
 	s, ix := newSearcher()
 	addDoc(ix, "https://a.com/1", "node network")

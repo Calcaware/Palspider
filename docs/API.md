@@ -6,7 +6,13 @@ header. Error responses use the shape `{"error":"<message>"}` with a non-2xx
 status code.
 
 This document describes version `0.2.0` of the API. Version is also reported
-at runtime by `GET /api/health` and `GET /api/status`.
+at runtime by `GET /api/health`, `GET /api/status`, and the
+`X-Palspider-Version` response header on every HTTP response.
+
+The project follows a simple compatibility policy: keep the existing JSON
+fields stable for supported endpoints and publish the semantic version in the
+response header plus the status payload. Breaking changes should be introduced
+with a new API version or compatibility notes in release documentation.
 
 ## Conventions
 
@@ -90,10 +96,20 @@ Query parameters:
 
 | Parameter | Default | Range | Meaning |
 |---|---|---|---|
-| `q` | (required) | - | Query terms. Leading/trailing whitespace is trimmed. Empty or missing `q` is a `400` error. |
+| `q` | (required) | - | Query terms. Leading/trailing whitespace is trimmed. Enclose words in double quotes to boost exact contiguous phrase matches, for example `q=%22search+engine%22`. Empty or missing `q` is a `400` error. |
 | `limit` | `10` | `1` to `100` | Maximum number of results to return. Values above `100` are clamped to `100`; non-numeric or less than `1` are `400` errors. |
 | `offset` | `0` | `0` to `99` | Number of results to skip before returning. The searchable window is capped so that `offset + limit` never exceeds `100` (the limit is reduced if needed). `offset >= 100` is a `400` error. |
+| `host` | unset | any host name | Restricts results to a specific host or subdomain, such as `example.com` or `docs.example.com`. |
+| `path` | unset | any path prefix | Restricts results to URLs whose path starts with the supplied prefix, such as `/docs` or `/blog`. |
+| `sort` | `relevance` | `relevance`, `newest`, `oldest`, `most_linked` | Orders the matched results by score, recency in the index, or inbound link count. Values are case-insensitive and may use spaces or hyphens, such as `most linked` or `most-linked`. |
 | `remote` | `0` | `0`, `1`, `true` | When `1` or `true`, results are also fetched from every registered peer (see peer fan-out). Defaults to local search only. |
+
+Pagination metadata is also reported in response headers:
+
+- `X-Palspider-Count`: number of results in this response page.
+- `X-Palspider-Offset`: offset used for the request.
+- `X-Palspider-Limit`: effective limit for this page.
+- `X-Palspider-Total`: total matching results for the unpaged query after filters are applied.
 
 Example:
 
@@ -134,6 +150,74 @@ Result object fields:
 | `score` | float | TF-IDF link-weighted score, rounded to two decimals. |
 | `linkCount` | int | Number of inbound links discovered so far. |
 | `peerSource` | string | Present only for results fetched from a peer (`remote=1`); the peer's URL. |
+
+The web UI selects a text excerpt around query matches and highlights the
+matched terms. Snippet rendering escapes indexed page content before adding
+highlight markup.
+
+### `GET /api/related`
+
+Finds indexed pages with the most overlapping content terms for a source URL.
+The source URL must already be indexed. The response is an array of result
+objects using the same fields as `/api/search`; `score` is the binary-term
+cosine similarity.
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `url` | (required) | absolute `http` or `https` URL | Indexed source page. |
+| `limit` | `5` | `1` to `20` | Maximum number of related pages; values above `20` are clamped. |
+
+### `GET /api/export`
+
+Exports indexed documents in ascending document ID order. Useful for backups,
+migrations, and offline analysis. The response is always a JSON array, even
+when no documents are indexed (an empty array `[]`).
+
+Query parameters:
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `limit` | `100` | `1` to `1000` | Maximum documents to return. Values above `1000` are clamped; non-numeric or less than `1` are `400` errors. |
+| `offset` | `0` | `>= 0` | Number of documents to skip. Negative or non-numeric values are `400` errors. |
+
+Pagination metadata is reported in the same response headers as
+`GET /api/search`: `X-Palspider-Count`, `X-Palspider-Offset`,
+`X-Palspider-Limit`, and `X-Palspider-Total`.
+
+Each document object uses these fields:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | int | Local document ID. |
+| `url` | string | Canonical page URL. |
+| `title` | string | Page title (case preserved). |
+| `text` | string | Extracted page text. |
+| `linkCount` | int | Number of inbound links discovered so far. |
+
+Example:
+
+```sh
+curl 'http://localhost:3000/api/export?limit=2&offset=0'
+```
+
+```json
+[
+  {
+    "id": 0,
+    "url": "https://nodejs.org/",
+    "title": "Node.js",
+    "text": "Node.js is a JavaScript runtime built on V8...",
+    "linkCount": 0
+  },
+  {
+    "id": 1,
+    "url": "https://expressjs.com/",
+    "title": "Express.js",
+    "text": "Express is a minimal and flexible Node.js web application framework...",
+    "linkCount": 0
+  }
+]
+```
 
 ### `GET /api/crawl` and `GET /crawl-status`
 

@@ -1,15 +1,20 @@
 package crawler
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/md5"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	stdhtml "html"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -127,6 +132,85 @@ func privateNetworkAllowed() bool {
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
+func splitCSV(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ';' || r == '\n' || r == '\r'
+	})
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(strings.ToLower(p))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func matchesHostPattern(host, pattern string) bool {
+	host = strings.Trim(strings.ToLower(host), ".")
+	pattern = strings.Trim(strings.ToLower(pattern), ".")
+	if pattern == "" {
+		return false
+	}
+	if pattern == "*" {
+		return true
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := strings.TrimPrefix(pattern, "*.")
+		return host == suffix || strings.HasSuffix(host, "."+suffix)
+	}
+	if strings.HasPrefix(pattern, ".") {
+		suffix := strings.TrimPrefix(pattern, ".")
+		return host == suffix || strings.HasSuffix(host, "."+suffix)
+	}
+	return host == pattern || strings.HasSuffix(host, "."+pattern)
+}
+
+func checkHostPolicy(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Hostname() == "" {
+		return fmt.Errorf("invalid URL")
+	}
+	host := u.Hostname()
+	allow := splitCSV(os.Getenv("PALSPIDER_ALLOWLIST"))
+	if len(allow) > 0 {
+		allowed := false
+		for _, p := range allow {
+			if matchesHostPattern(host, p) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("host %q not allowed by policy", host)
+		}
+	}
+	deny := splitCSV(os.Getenv("PALSPIDER_DENYLIST"))
+	for _, p := range deny {
+		if matchesHostPattern(host, p) {
+			return fmt.Errorf("host %q blocked by policy", host)
+		}
+	}
+	return nil
+}
+
+// CheckURLPolicy validates URL scheme, host safety, and optional allowlist/
+// denylist policy. It is used by web and API URL validators so the crawler and
+// seed input follow the same host policy.
+func CheckURLPolicy(rawURL string) error {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("invalid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("unsupported scheme %q", u.Scheme)
+	}
+	return checkHostPolicy(u.String())
+}
+
 // checkHostAllowed blocks requests to loopback, link-local, and private
 // addresses unless PALSPIDER_ALLOW_PRIVATE is set. Every resolved IP must be
 // allowed.
@@ -187,6 +271,12 @@ func FetchContext(ctx context.Context, rawURL string, limiter *RateLimiter) (str
 	if err := checkHostAllowed(u.Host); err != nil {
 		return "", err
 	}
+	if err := checkHostPolicy(rawURL); err != nil {
+		return "", err
+	}
+	if !isRobotsAllowed(rawURL) {
+		return "", fmt.Errorf("robots.txt disallows %s", rawURL)
+	}
 
 	if limiter != nil {
 		limiter.Wait(u.Host)
@@ -234,33 +324,158 @@ func doFetch(ctx context.Context, rawURL string) (string, error) {
 	}
 
 	ct := resp.Header.Get("Content-Type")
-	if !strings.Contains(ct, "text/html") {
-		return "", &serverError{fmt.Sprintf("unsupported content-type: %s", ct)}
+	if strings.Contains(ct, "text/html") {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+		if err != nil {
+			return "", err
+		}
+		return string(body), nil
+	}
+	if strings.Contains(ct, "application/pdf") || strings.Contains(ct, "application/octet-stream") && strings.Contains(strings.ToLower(rawURL), ".pdf") {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		if err != nil {
+			return "", err
+		}
+		text, pdfErr := extractPDFText(body)
+		if pdfErr != nil {
+			return "", &serverError{fmt.Sprintf("unsupported content-type: %s", ct)}
+		}
+		return text, nil
+	}
+	if strings.Contains(ct, "application/vnd.openxmlformats-officedocument.wordprocessingml.document") || strings.Contains(ct, "application/msword") || strings.Contains(ct, "application/vnd.ms-word") || strings.Contains(strings.ToLower(rawURL), ".docx") || strings.Contains(strings.ToLower(rawURL), ".doc") {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
+		if err != nil {
+			return "", err
+		}
+		text, docErr := extractDocText(body)
+		if docErr != nil {
+			return "", &serverError{fmt.Sprintf("unsupported content-type: %s", ct)}
+		}
+		return text, nil
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 5<<20))
+	return "", &serverError{fmt.Sprintf("unsupported content-type: %s", ct)}
+}
+
+func extractPDFText(data []byte) (string, error) {
+	if len(data) == 0 {
+		return "", fmt.Errorf("empty pdf")
+	}
+	if pdfText, err := parsePDFText(data); err == nil && pdfText != "" {
+		return pdfText, nil
+	}
+	return "", fmt.Errorf("pdf parsing unavailable")
+}
+
+func extractDocText(data []byte) (string, error) {
+	if len(data) < 4 {
+		return "", fmt.Errorf("empty doc")
+	}
+	if len(data) > 4 && bytes.Equal(data[:4], []byte{0x50, 0x4B, 0x03, 0x04}) {
+		return extractDOCXText(data)
+	}
+	return "", fmt.Errorf("doc extraction unsupported")
+}
+
+func extractDOCXText(data []byte) (string, error) {
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
 	if err != nil {
 		return "", err
 	}
-	return string(body), nil
+	var parts []string
+	for _, f := range zr.File {
+		if f.Name == "word/document.xml" {
+			body, err := readZipFile(f)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, extractXMLText(body))
+		}
+	}
+	text := strings.Join(parts, " ")
+	if text == "" {
+		return "", fmt.Errorf("no document content")
+	}
+	return text, nil
+}
+
+func readZipFile(f *zip.File) ([]byte, error) {
+	fr, err := f.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer fr.Close()
+	return io.ReadAll(fr)
+}
+
+func extractXMLText(data []byte) string {
+	var node struct {
+		XMLName xml.Name
+		Text    string `xml:",innerxml"`
+	}
+	if err := xml.Unmarshal(data, &node); err != nil {
+		return ""
+	}
+	return stripXMLTags(node.Text)
+}
+
+func stripXMLTags(s string) string {
+	var b strings.Builder
+	inTag := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '<' {
+			inTag = true
+			continue
+		}
+		if s[i] == '>' {
+			inTag = false
+			continue
+		}
+		if !inTag {
+			b.WriteByte(s[i])
+		}
+	}
+	return strings.Join(strings.Fields(stdhtml.UnescapeString(b.String())), " ")
+}
+
+func parsePDFText(data []byte) (string, error) {
+	if strings.Contains(string(data[:min(len(data), 512)]), "%PDF-") {
+		cmd := exec.Command("pdftotext", "-layout", "-")
+		cmd.Stdin = bytes.NewReader(data)
+		out, err := cmd.Output()
+		if err == nil && len(out) > 0 {
+			return strings.Join(strings.Fields(string(out)), " "), nil
+		}
+	}
+	return "", fmt.Errorf("unsupported pdf")
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // ExtractText pulls out the page title and visible body text, preserving the
 // original casing. The original casing is kept because titles and snippets are
 // shown to users; matching lowercases later in Tokenize.
 func ExtractText(html string) (title, text string) {
+	html = stripComments(html)
 	title = strings.TrimSpace(extractContent(html, "title"))
+	title = stdhtml.UnescapeString(stripHTML(title))
 
 	body := extractContent(html, "body")
 	if body == "" {
 		body = html
 	}
 
-	for _, tag := range []string{"script", "style", "nav", "footer", "header", "noscript"} {
+	for _, tag := range []string{"script", "style", "nav", "footer", "header", "noscript", "iframe", "template", "svg"} {
 		body = stripBlocks(body, tag)
 	}
 
 	body = stripHTML(body)
+	body = stdhtml.UnescapeString(body)
 	body = strings.Join(strings.Fields(body), " ")
 	return title, body
 }
@@ -270,6 +485,7 @@ func ExtractText(html string) (title, text string) {
 // strings are not mistaken for real anchors. Double-quoted, single-quoted, and
 // unquoted values are all supported.
 func ExtractLinks(html string, base *url.URL) []string {
+	html = stripComments(html)
 	for _, tag := range []string{"script", "style", "noscript"} {
 		html = stripBlocks(html, tag)
 	}
@@ -500,12 +716,19 @@ func extractContent(s, tag string) string {
 	}
 	contentStart := gt + 1
 
-	closeTag := "</" + tag + ">"
-	end := indexFold(s, closeTag, contentStart)
-	if end == -1 {
-		return ""
+	closePrefix := "</" + tag
+	from = contentStart
+	for {
+		end := indexFold(s, closePrefix, from)
+		if end == -1 {
+			return s[contentStart:]
+		}
+		if !afterTagName(s, end+len(closePrefix)) {
+			from = end + len(closePrefix)
+			continue
+		}
+		return s[contentStart:end]
 	}
-	return s[contentStart:end]
 }
 
 func stripBlocks(s, tag string) string {
@@ -524,12 +747,14 @@ func stripBlocks(s, tag string) string {
 		}
 		gt := tagEnd(s, start)
 		if gt == -1 {
-			break
+			result.WriteString(s[:start])
+			return result.String()
 		}
 		tagEndIdx := gt + 1
 		end := indexFold(s, closeTag, tagEndIdx)
 		if end == -1 {
-			break
+			result.WriteString(s[:start])
+			return result.String()
 		}
 		result.WriteString(s[:start])
 		s = s[end+len(closeTag):]
@@ -537,6 +762,23 @@ func stripBlocks(s, tag string) string {
 	}
 	result.WriteString(s)
 	return result.String()
+}
+
+func stripComments(s string) string {
+	var result strings.Builder
+	for {
+		start := strings.Index(s, "<!--")
+		if start == -1 {
+			result.WriteString(s)
+			return result.String()
+		}
+		result.WriteString(s[:start])
+		end := strings.Index(s[start+4:], "-->")
+		if end == -1 {
+			return result.String()
+		}
+		s = s[start+4+end+3:]
+	}
 }
 
 func stripHTML(s string) string {

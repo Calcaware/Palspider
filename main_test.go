@@ -208,6 +208,30 @@ func TestSuggestWithLimit(t *testing.T) {
 	}
 }
 
+func TestPublicRateLimit(t *testing.T) {
+	t.Setenv("PALSPIDER_PUBLIC_RATE_LIMIT", "1")
+	ts, done := newTestServer(t)
+	defer done()
+
+	resp := getResp(t, ts.URL+"/api/search?q=node")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("first /api/search status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Palspider-Version"); got == "" {
+		t.Fatal("first /api/search missing X-Palspider-Version header")
+	}
+	resp.Body.Close()
+
+	resp = getResp(t, ts.URL+"/api/search?q=node")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second /api/search status = %d, want 429", resp.StatusCode)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "rate limit exceeded") {
+		t.Fatalf("rate limit body = %q, want rate limit exceeded", body)
+	}
+}
 func TestAPIHealth(t *testing.T) {
 	ts, done := newTestServer(t)
 	defer done()
@@ -485,6 +509,14 @@ func TestAPISearchValidation(t *testing.T) {
 		t.Errorf("offset results = %d, want 1", len(res))
 	}
 
+	code, ct, body = get(t, ts.URL+"/api/search?q=alpha&limit=1&offset=1")
+	if code != 200 || !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("GET /api/search pagination response = %d %q, want 200 JSON", code, ct)
+	}
+	if !strings.Contains(body, "\"url\":\"https://example.com/b\"") {
+		t.Fatalf("offset page body = %q, want second result", body)
+	}
+
 	code, _, body = get(t, ts.URL+"/api/search?q=alpha&offset=100")
 	if code != 400 || !strings.Contains(body, "offset must be less than 100") {
 		t.Errorf("offset 100 = %d %q, want 400", code, body)
@@ -621,6 +653,234 @@ func TestCORSOnlyOnReads(t *testing.T) {
 	resp.Body.Close()
 	if resp.Header.Get("X-Content-Type-Options") != "nosniff" {
 		t.Errorf("X-Content-Type-Options = %q, want nosniff", resp.Header.Get("X-Content-Type-Options"))
+	}
+}
+
+func TestCrawlPauseResumeAndHostStats(t *testing.T) {
+	ts, _, done := newTestServerE(t)
+	defer done()
+
+	resp := postJSON(t, ts.URL+"/api/crawl/pause", `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/crawl/pause status = %d, want 200", resp.StatusCode)
+	}
+	var paused map[string]interface{}
+	decodeJSON(t, resp, &paused)
+	if paused["paused"] != true {
+		t.Fatalf("pause response = %#v, want paused=true", paused)
+	}
+
+	code, _, body := get(t, ts.URL+"/api/status")
+	if code != 200 {
+		t.Fatalf("GET /api/status = %d, want 200", code)
+	}
+	if !strings.Contains(body, `"paused":true`) {
+		t.Fatalf("status body = %s, want paused true", body)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/crawl/resume", `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/crawl/resume status = %d, want 200", resp.StatusCode)
+	}
+	var resumed map[string]interface{}
+	decodeJSON(t, resp, &resumed)
+	if resumed["paused"] != false {
+		t.Fatalf("resume response = %#v, want paused=false", resumed)
+	}
+
+	code, _, body = get(t, ts.URL+"/api/status")
+	if code != 200 {
+		t.Fatalf("GET /api/status after resume = %d, want 200", code)
+	}
+	if !strings.Contains(body, `"paused":false`) {
+		t.Fatalf("status body after resume = %s, want paused false", body)
+	}
+
+}
+
+func TestCrawlClearAndRequeue(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Seed("https://example.com")
+	resp := postJSON(t, ts.URL+"/api/crawl/clear", `{}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/crawl/clear status = %d, want 200", resp.StatusCode)
+	}
+	var cleared map[string]interface{}
+	decodeJSON(t, resp, &cleared)
+	if cleared["queueSize"] != float64(0) {
+		t.Fatalf("clear response = %#v, want queueSize 0", cleared)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/crawl/requeue", `{"url":"https://example.com"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("POST /api/crawl/requeue status = %d, want 202", resp.StatusCode)
+	}
+	var requeued map[string]interface{}
+	decodeJSON(t, resp, &requeued)
+	if requeued["status"] != "accepted" {
+		t.Fatalf("requeue response = %#v, want accepted", requeued)
+	}
+}
+
+func TestPeerTokenGuardsPeerTraffic(t *testing.T) {
+	t.Setenv("PALSPIDER_PEER_TOKEN", "peer-secret")
+	req := httptest.NewRequest(http.MethodGet, "/api/peers/gossip", nil)
+	rec := httptest.NewRecorder()
+	wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /api/peers/gossip without bearer token = %d, want 401", rec.Code)
+	}
+	req.Header.Set("Authorization", "Bearer peer-secret")
+	rec = httptest.NewRecorder()
+	wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })).ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/peers/gossip with bearer token = %d, want 200", rec.Code)
+	}
+}
+
+func TestFilterSearchResults(t *testing.T) {
+	results := []searcher.Result{
+		{URL: "https://docs.example.com/guide/install", Title: "Install guide"},
+		{URL: "https://example.com/blog/post", Title: "Blog post"},
+		{URL: "https://sub.example.com/help", Title: "Help"},
+	}
+
+	filtered := filterSearchResults(results, url.Values{"host": {"example.com"}})
+	if len(filtered) != 3 {
+		t.Fatalf("host filter = %d results, want 3 (exact host + subdomains)", len(filtered))
+	}
+	if filtered[0].URL != "https://docs.example.com/guide/install" {
+		t.Fatalf("host filter returned %#v, want docs.example.com entry first", filtered)
+	}
+
+	filtered = filterSearchResults(results, url.Values{"path": {"/blog"}})
+	if len(filtered) != 1 || filtered[0].URL != "https://example.com/blog/post" {
+		t.Fatalf("path filter = %#v, want only blog entry", filtered)
+	}
+}
+
+func TestAPIRelated(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+	e.AddDocument("https://related.example/source", "Crawler search", "crawler search indexing ranking")
+	e.AddDocument("https://related.example/match", "Search indexing", "crawler search indexing tools")
+
+	code, _, body := get(t, ts.URL+"/api/related?url="+url.QueryEscape("https://related.example/source"))
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/related status = %d, want 200: %s", code, body)
+	}
+	var results []searcher.Result
+	if err := json.Unmarshal([]byte(body), &results); err != nil {
+		t.Fatalf("decode related response: %v", err)
+	}
+	foundMatch := false
+	for _, result := range results {
+		if result.URL == "https://related.example/match" {
+			foundMatch = true
+		}
+		if result.URL == "https://related.example/source" {
+			t.Fatal("related response included the source document")
+		}
+	}
+	if !foundMatch {
+		t.Fatalf("related response = %#v, missing matching page", results)
+	}
+
+	code, _, body = get(t, ts.URL+"/api/related?url=not-a-url")
+	if code != http.StatusBadRequest || !strings.Contains(body, "absolute http or https URL") {
+		t.Fatalf("invalid related URL response = %d %q, want 400 validation error", code, body)
+	}
+}
+
+func TestAPIExport(t *testing.T) {
+	ts, done := newTestServer(t)
+	defer done()
+
+	resp := getResp(t, ts.URL+"/api/export")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/export status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("export content-type = %q, want application/json", ct)
+	}
+	if got := resp.Header.Get("X-Palspider-Total"); got != "7" {
+		t.Fatalf("X-Palspider-Total = %q, want 7", got)
+	}
+	if got := resp.Header.Get("X-Palspider-Count"); got != "7" {
+		t.Fatalf("X-Palspider-Count = %q, want 7", got)
+	}
+
+	type doc struct {
+		ID        int    `json:"id"`
+		URL       string `json:"url"`
+		Title     string `json:"title"`
+		Text      string `json:"text"`
+		LinkCount int    `json:"linkCount"`
+	}
+	var all []doc
+	if err := json.NewDecoder(resp.Body).Decode(&all); err != nil {
+		t.Fatalf("decode export: %v", err)
+	}
+	if len(all) != 7 {
+		t.Fatalf("export = %d documents, want 7", len(all))
+	}
+	for i, d := range all {
+		if d.URL == "" || d.Title == "" {
+			t.Fatalf("export[%d] missing url/title: %+v", i, d)
+		}
+		if i > 0 && d.ID <= all[i-1].ID {
+			t.Fatalf("export not in ascending ID order at %d: %d after %d", i, d.ID, all[i-1].ID)
+		}
+	}
+
+	code, _, body := get(t, ts.URL+"/api/export?limit=2&offset=1")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/export paginated status = %d, want 200", code)
+	}
+	var page []doc
+	if err := json.Unmarshal([]byte(body), &page); err != nil {
+		t.Fatalf("decode page: %v", err)
+	}
+	if len(page) != 2 || page[0].ID != 1 || page[1].ID != 2 {
+		t.Fatalf("paged export = %+v, want IDs 1 and 2", page)
+	}
+
+	if _, _, body = get(t, ts.URL+"/api/export?offset=99"); strings.TrimSpace(body) != "[]" {
+		t.Fatalf("offset past end body = %q, want []", body)
+	}
+
+	if code, _, body = get(t, ts.URL+"/api/export?limit=0"); code != 400 || !strings.Contains(body, "limit must be an integer >= 1") {
+		t.Fatalf("limit=0 = %d %q, want 400", code, body)
+	}
+	if code, _, _ = get(t, ts.URL+"/api/export?limit=abc"); code != 400 {
+		t.Fatalf("limit=abc = %d, want 400", code)
+	}
+	if code, _, body = get(t, ts.URL+"/api/export?offset=-1"); code != 400 || !strings.Contains(body, "offset must be an integer >= 0") {
+		t.Fatalf("offset=-1 = %d %q, want 400", code, body)
+	}
+	if code, _, _ = get(t, ts.URL+"/api/export?limit=100000"); code != 200 {
+		t.Fatalf("limit=100000 = %d, want 200 (clamped)", code)
+	}
+}
+
+func TestHighlightSnippetSelectsRelevantTextAndEscapesHTML(t *testing.T) {
+	got := string(highlightSnippet("opening text with unrelated words, then Search Engine appears near the end", "search engine", 42))
+	if !strings.Contains(got, "<mark>Search</mark> <mark>Engine</mark>") {
+		t.Fatalf("snippet does not highlight the query terms: %s", got)
+	}
+	if !strings.HasPrefix(got, "...") {
+		t.Fatalf("snippet should select a window around the query: %s", got)
+	}
+	got = string(highlightSnippet("<script>alert(1)</script>", "alert", 200))
+	if !strings.Contains(got, "&lt;script&gt;") || strings.Contains(got, "<script>") {
+		t.Fatalf("snippet did not escape HTML content: %s", got)
 	}
 }
 

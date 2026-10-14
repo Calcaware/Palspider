@@ -1,12 +1,16 @@
 package crawler
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -42,13 +46,88 @@ func TestExtractTextPreservesCase(t *testing.T) {
 }
 
 func TestExtractTextStripsBoilerplate(t *testing.T) {
-	html := `<body><nav>Home About</nav><p>Real content here</p><footer>copyright</footer></body>`
+	html := `<body><nav>Home About</nav><p>Real content here</p><footer>copyright</footer>` +
+		`<svg>icon paths</svg><template>fallback content</template></body>`
 	_, text := ExtractText(html)
-	if strings.Contains(text, "Home") || strings.Contains(text, "copyright") {
-		t.Errorf("nav/footer not stripped: %q", text)
+	for _, omitted := range []string{"Home", "copyright", "icon paths", "fallback content"} {
+		if strings.Contains(text, omitted) {
+			t.Errorf("%q boilerplate was not stripped: %q", omitted, text)
+		}
 	}
 	if !strings.Contains(text, "Real content here") {
 		t.Errorf("body text missing: %q", text)
+	}
+}
+
+func TestExtractTextHandlesCommentsEntitiesAndUnclosedTags(t *testing.T) {
+	input := `<html><head><title>Tom &amp; Jerry</title></head><body>` +
+		`<!-- hidden comment -->Visible &lt;safe&gt; text` +
+		`<script>hidden script without a close`
+	title, text := ExtractText(input)
+	if title != "Tom & Jerry" {
+		t.Fatalf("title = %q, want decoded entity", title)
+	}
+	if text != "Visible <safe> text" {
+		t.Fatalf("text = %q, want comments and unclosed script removed and entities decoded", text)
+	}
+}
+
+func TestFetchSupportsDOCXContent(t *testing.T) {
+	t.Setenv("PALSPIDER_ALLOW_PRIVATE", "1")
+	var doc bytes.Buffer
+	zw := zip.NewWriter(&doc)
+	w, err := zw.Create("word/document.xml")
+	if err != nil {
+		t.Fatalf("zip create: %v", err)
+	}
+	_, err = w.Write([]byte(`<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>Hello from DOCX</w:t></w:r></w:p></w:body></w:document>`))
+	if err != nil {
+		t.Fatalf("zip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("zip close: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+		w.Write(doc.Bytes())
+	}))
+	defer srv.Close()
+
+	body, err := Fetch(srv.URL, NewRateLimiter(0))
+	if err != nil {
+		t.Fatalf("Fetch(docx): %v", err)
+	}
+	if !strings.Contains(body, "Hello from DOCX") {
+		t.Fatalf("docx body = %q, want extracted text", body)
+	}
+}
+
+func TestExtractPDFTextRequiresTooling(t *testing.T) {
+	if _, err := exec.LookPath("pdftotext"); err != nil {
+		t.Skip("pdftotext not installed")
+	}
+	pdf := `%PDF-1.4
+1 0 obj
+<< /Type /Catalog >>
+endobj
+trailer
+<< /Root 1 0 R >>
+%%EOF`
+	text, err := extractPDFText([]byte(pdf))
+	if err == nil && strings.Contains(text, "") {
+		return
+	}
+	if err != nil {
+		t.Fatalf("extractPDFText on minimal PDF: %v", err)
+	}
+}
+
+func TestExtractLinksIgnoresCommentedMarkup(t *testing.T) {
+	base, _ := url.Parse("https://example.com/")
+	links := ExtractLinks(`<!-- <a href="/fake">fake</a> --><a href="/real">real</a>`, base)
+	if len(links) != 1 || links[0] != "https://example.com/real" {
+		t.Fatalf("ExtractLinks() = %v, want only the real link", links)
 	}
 }
 
@@ -138,6 +217,50 @@ func TestFetchBlocksPrivateAddresses(t *testing.T) {
 		if _, err := Fetch(u, nil); err == nil || !strings.Contains(err.Error(), "blocked") {
 			t.Errorf("Fetch(%q) err = %v, want blocked error", u, err)
 		}
+	}
+}
+
+func TestCheckURLPolicyRespectsAllowlistAndDenylist(t *testing.T) {
+	t.Setenv("PALSPIDER_ALLOWLIST", "example.com, *.example.org")
+	t.Setenv("PALSPIDER_DENYLIST", "blocked.example.com")
+
+	for _, u := range []string{"https://example.com/path", "https://api.example.org/v1"} {
+		if err := CheckURLPolicy(u); err != nil {
+			t.Fatalf("CheckURLPolicy(%q) = %v, want nil", u, err)
+		}
+	}
+	if err := CheckURLPolicy("https://notexample.com"); err == nil {
+		t.Fatal("CheckURLPolicy should reject hosts outside allowlist")
+	}
+	if err := CheckURLPolicy("https://blocked.example.com"); err == nil {
+		t.Fatal("CheckURLPolicy should reject denylisted hosts")
+	}
+}
+
+func TestRobotsPolicyDisallowsBlockedPaths(t *testing.T) {
+	t.Setenv("PALSPIDER_ALLOW_PRIVATE", "1")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/robots.txt":
+			w.Header().Set("Content-Type", "text/plain")
+			io.WriteString(w, "User-agent: *\nDisallow: /private\nAllow: /public\n")
+		case "/public/ok":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte("<html><body>public</body></html>"))
+		case "/private/secret":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write([]byte("<html><body>secret</body></html>"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	if !isRobotsAllowed(server.URL + "/public/ok") {
+		t.Fatal("allowed public path should pass robot policy")
+	}
+	if isRobotsAllowed(server.URL + "/private/secret") {
+		t.Fatal("disallowed private path should fail robot policy")
 	}
 }
 

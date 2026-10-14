@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/calcaware/palspider/searcher"
 )
@@ -120,5 +122,59 @@ func TestCrawlStatusUsesAtomicLoads(t *testing.T) {
 	cs = e.CrawlStatus()
 	if !cs.Crawling || cs.Active != 1 || cs.QueueSize != 3 {
 		t.Errorf("CrawlStatus = %+v, want active 1 queue 3 crawling true", cs)
+	}
+}
+
+func TestExportDocumentsPaginates(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.AddDocument("https://a.com/page", "A", "alpha")
+	e.AddDocument("https://b.com/page", "B", "beta")
+	e.AddDocument("https://c.com/page", "C", "gamma")
+
+	page, total := e.ExportDocuments(0, 2)
+	if total != 3 || len(page) != 2 {
+		t.Fatalf("ExportDocuments(0,2) = %d docs / total %d, want 2 / 3", len(page), total)
+	}
+	if page[0].URL != "https://a.com/page" || page[1].URL != "https://b.com/page" {
+		t.Errorf("first page = %+v, want a.com then b.com", page)
+	}
+	if page[0].Title != "A" {
+		t.Errorf("exported title = %q, want A", page[0].Title)
+	}
+
+	page, total = e.ExportDocuments(2, 10)
+	if total != 3 || len(page) != 1 || page[0].URL != "https://c.com/page" {
+		t.Fatalf("ExportDocuments(2,10) = %+v / total %d, want only c.com / 3", page, total)
+	}
+
+	if page, total = e.ExportDocuments(5, 10); total != 3 || len(page) != 0 {
+		t.Fatalf("ExportDocuments(5,10) = %+v / total %d, want empty / 3", page, total)
+	}
+
+	if page, total = e.ExportDocuments(0, 0); total != 3 || len(page) != 3 {
+		t.Fatalf("ExportDocuments(0,0) = %d docs, want all 3 (no cap)", len(page))
+	}
+}
+
+func TestScheduleRetryDefersFailuresForOneHour(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	url := "https://example.com/retry"
+	e.mu.Lock()
+	e.visited[url] = struct{}{}
+	e.mu.Unlock()
+
+	e.scheduleRetry(url, 0, errors.New("temporary network failure"))
+
+	e.mu.Lock()
+	at, exists := e.retryAt[url]
+	e.mu.Unlock()
+	if !exists {
+		t.Fatal("retry timestamp missing after failure")
+	}
+	if wait := time.Until(at); wait < 59*time.Minute || wait > time.Hour+time.Minute {
+		t.Fatalf("retry window = %v, want roughly 1 hour", wait)
+	}
+	if delay := e.retryDelay(url); delay <= 0 || delay > time.Hour {
+		t.Fatalf("retryDelay = %v, want a positive delay within 1 hour", delay)
 	}
 }

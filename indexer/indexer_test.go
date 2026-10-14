@@ -32,6 +32,27 @@ func TestIDForURL(t *testing.T) {
 	}
 }
 
+func TestAllDocsReturnsIndexedDocuments(t *testing.T) {
+	ix := New()
+	ix.AddDocument("https://a.com/1", "One", "first", []string{"first"})
+	ix.AddDocument("https://a.com/2", "Two", "second", []string{"second"})
+	ix.RestoreDocument(Document{ID: 4, URL: "https://a.com/4", Title: "Four", Text: "fourth"})
+
+	docs := ix.AllDocs()
+	if len(docs) != 3 {
+		t.Fatalf("AllDocs = %d docs, want 3 (sparse slots skipped)", len(docs))
+	}
+	wantIDs := []int{0, 1, 4}
+	for i, want := range wantIDs {
+		if docs[i].ID != want {
+			t.Errorf("AllDocs[%d].ID = %d, want %d", i, docs[i].ID, want)
+		}
+	}
+	if docs[2].URL != "https://a.com/4" || docs[2].Title != "Four" {
+		t.Errorf("AllDocs[2] = %+v, want the restored document", docs[2])
+	}
+}
+
 func TestWalkTerms(t *testing.T) {
 	ix := New()
 	ix.AddDocument("u", "t", "alpha beta alpha", []string{"alpha", "beta", "alpha"})

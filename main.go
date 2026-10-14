@@ -5,17 +5,21 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	stdhtml "html"
 	"html/template"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/calcaware/palspider/crawler"
 	"github.com/calcaware/palspider/engine"
@@ -129,8 +133,14 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("POST /api/peers", handleAPIPeersAdd(e))
 	mux.HandleFunc("DELETE /api/peers", handleAPIPeersRemove(e))
 	mux.HandleFunc("GET /api/search", handleAPISearch(e))
+	mux.HandleFunc("GET /api/related", handleAPIRelated(e))
+	mux.HandleFunc("GET /api/export", handleAPIExport(e))
 	mux.HandleFunc("GET /api/crawl", handleCrawlStatus(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
+	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
+	mux.HandleFunc("POST /api/crawl/resume", handleAPICrawlResume(e))
+	mux.HandleFunc("POST /api/crawl/clear", handleAPICrawlClear(e))
+	mux.HandleFunc("POST /api/crawl/requeue", handleAPICrawlRequeue(e))
 	mux.HandleFunc("GET /api/suggest", handleSuggest(e))
 	mux.HandleFunc("GET /api/peers/gossip", handleAPIPeersGossip(e))
 
@@ -148,6 +158,7 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 func wrap(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Palspider-Version", version)
 		if isReadAPI(r) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
@@ -156,8 +167,59 @@ func wrap(h http.Handler) http.Handler {
 			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
+		if !peerAuthorized(r) {
+			w.Header().Set("WWW-Authenticate", `Basic realm="palspider"`)
+			writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		if r.Method == http.MethodGet && os.Getenv("PALSPIDER_PUBLIC_RATE_LIMIT") != "" {
+			limit, err := strconv.Atoi(os.Getenv("PALSPIDER_PUBLIC_RATE_LIMIT"))
+			if err == nil && limit > 0 {
+				if !rateLimitRequest(r.RemoteAddr, limit, 60) {
+					writeJSONError(w, http.StatusTooManyRequests, "rate limit exceeded")
+					return
+				}
+			}
+		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+var publicRateLimiter = struct {
+	mu   sync.Mutex
+	seen map[string][]time.Time
+}{
+	seen: make(map[string][]time.Time),
+}
+
+func clientKey(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return strings.TrimSpace(remoteAddr)
+}
+
+func rateLimitRequest(remoteAddr string, limit, windowSeconds int) bool {
+	if limit <= 0 {
+		return true
+	}
+	key := clientKey(remoteAddr)
+	publicRateLimiter.mu.Lock()
+	defer publicRateLimiter.mu.Unlock()
+	cutoff := time.Now().Add(-time.Duration(windowSeconds) * time.Second)
+	entries := publicRateLimiter.seen[key]
+	filtered := entries[:0]
+	for _, ts := range entries {
+		if ts.After(cutoff) {
+			filtered = append(filtered, ts)
+		}
+	}
+	publicRateLimiter.seen[key] = filtered
+	if len(filtered) >= limit {
+		return false
+	}
+	publicRateLimiter.seen[key] = append(filtered, time.Now())
+	return true
 }
 
 // isReadAPI reports whether the request is a safe read of JSON, where
@@ -191,6 +253,23 @@ func authorized(r *http.Request) bool {
 		subtle.ConstantTimeCompare([]byte(pass), []byte(wantPass)) == 1
 }
 
+func peerAuthorized(r *http.Request) bool {
+	token := strings.TrimSpace(os.Getenv("PALSPIDER_PEER_TOKEN"))
+	if token == "" {
+		return true
+	}
+	switch r.URL.Path {
+	case "/api/peers/gossip", "/api/search", "/api/status":
+	default:
+		return true
+	}
+	auth := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(auth), "bearer ") {
+		auth = strings.TrimSpace(auth[7:])
+	}
+	return subtle.ConstantTimeCompare([]byte(auth), []byte(token)) == 1
+}
+
 func seed(e *engine.Engine) {
 	docs := []struct{ url, title, text string }{
 		{"https://nodejs.org", "Node.js",
@@ -216,19 +295,147 @@ func seed(e *engine.Engine) {
 
 func parseTemplates() *template.Template {
 	funcs := template.FuncMap{
-		"snippet": snippet,
+		"highlightSnippet": highlightSnippet,
 	}
 	return template.Must(template.New("").Funcs(funcs).ParseFS(embeddedFS, "views/*.html"))
 }
 
-// snippet returns the first n runes of s, appending an ellipsis when text was
-// cut. Slicing by runes keeps multi-byte characters intact.
-func snippet(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
+func highlightSnippet(s, query string, n int) template.HTML {
+	if n <= 0 {
+		return ""
 	}
-	return string(runes[:n]) + "..."
+	runes := []rune(s)
+	terms := crawler.Tokenize(query)
+	if len(runes) == 0 {
+		return ""
+	}
+	if len(runes) <= n {
+		return template.HTML(renderHighlighted(runes, terms, 0, len(runes)))
+	}
+
+	lower := []rune(strings.ToLower(string(runes)))
+	type span struct {
+		start int
+		end   int
+		term  string
+	}
+	var matches []span
+	for _, term := range terms {
+		word := []rune(strings.ToLower(term))
+		if len(word) == 0 || len(word) > len(lower) {
+			continue
+		}
+		for i := 0; i+len(word) <= len(lower); i++ {
+			if i > 0 && isSearchWordRune(lower[i-1]) {
+				continue
+			}
+			if i+len(word) < len(lower) && isSearchWordRune(lower[i+len(word)]) {
+				continue
+			}
+			matched := true
+			for j := range word {
+				if lower[i+j] != word[j] {
+					matched = false
+					break
+				}
+			}
+			if matched {
+				matches = append(matches, span{start: i, end: i + len(word), term: term})
+			}
+		}
+	}
+
+	start := 0
+	if len(matches) > 0 {
+		bestScore := -1
+		for _, match := range matches {
+			candidate := match.start - n/3
+			if candidate < 0 {
+				candidate = 0
+			}
+			if candidate+n > len(runes) {
+				candidate = len(runes) - n
+			}
+			seen := make(map[string]struct{})
+			score := 0
+			for _, other := range matches {
+				if other.start < candidate+n && other.end > candidate {
+					score++
+					seen[other.term] = struct{}{}
+				}
+			}
+			score += len(seen) * 2
+			if score > bestScore || (score == bestScore && candidate < start) {
+				bestScore = score
+				start = candidate
+			}
+		}
+	}
+	end := start + n
+	if end > len(runes) {
+		end = len(runes)
+	}
+	result := renderHighlighted(runes, terms, start, end)
+	if start > 0 {
+		result = "..." + result
+	}
+	if end < len(runes) {
+		result += "..."
+	}
+	return template.HTML(result)
+}
+
+func renderHighlighted(source []rune, terms []string, start, end int) string {
+	matched := make([]bool, end-start)
+	lower := []rune(strings.ToLower(string(source)))
+	for _, term := range terms {
+		word := []rune(strings.ToLower(term))
+		if len(word) == 0 {
+			continue
+		}
+		for i := start; i+len(word) <= end; i++ {
+			if i > 0 && isSearchWordRune(lower[i-1]) {
+				continue
+			}
+			if i+len(word) < len(lower) && isSearchWordRune(lower[i+len(word)]) {
+				continue
+			}
+			ok := true
+			for j := range word {
+				if lower[i+j] != word[j] {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				for j := i; j < i+len(word); j++ {
+					matched[j-start] = true
+				}
+			}
+		}
+	}
+
+	var out strings.Builder
+	for i := start; i < end; {
+		isMatch := matched[i-start]
+		j := i + 1
+		for j < end && matched[j-start] == isMatch {
+			j++
+		}
+		if isMatch {
+			out.WriteString("<mark>")
+		}
+		out.WriteString(stdhtml.EscapeString(string(source[i:j])))
+		if isMatch {
+			out.WriteString("</mark>")
+		}
+		i = j
+	}
+	return out.String()
+}
+
+func isSearchWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsNumber(r) || r == '-'
 }
 
 // writeJSON sends v as JSON with the given status code. HTML escaping is
@@ -250,8 +457,7 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 
 // validSeedURL accepts only absolute http(s) URLs.
 func validSeedURL(raw string) bool {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+	return crawler.CheckURLPolicy(raw) == nil
 }
 
 // render executes a template, logging failures after headers were written.
@@ -290,17 +496,28 @@ func handleNotFound(w http.ResponseWriter, r *http.Request) {
 const (
 	pageSize = 10
 	maxPage  = 10
+
+	// exportMaxLimit caps a single JSON export page so one request cannot
+	// buffer an unbounded slice of the corpus.
+	exportMaxLimit = 1000
 )
 
-// searchURL builds a results-page link for the given query and page.
-func searchURL(query string, page int) string {
-	return "/search?" + url.Values{"q": {query}, "page": {strconv.Itoa(page)}}.Encode()
+// searchURL builds a results-page link for the given query, page, and sort order.
+func searchURL(query string, page int, sort string) string {
+	values := url.Values{"q": {query}, "page": {strconv.Itoa(page)}}
+	sortOrder := string(searcher.NormalizeSortOrder(sort))
+	if sortOrder != "" && sortOrder != string(searcher.SortRelevance) {
+		values.Set("sort", sortOrder)
+	}
+	return "/search?" + values.Encode()
 }
 
 func handleSearch(e *engine.Engine, tmpl *template.Template) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		sortOrder := string(searcher.NormalizeSortOrder(r.URL.Query().Get("sort")))
 		data := map[string]interface{}{
 			"Query":       "",
+			"Sort":        sortOrder,
 			"Stats":       e.Stats(),
 			"CrawlNotice": r.URL.Query().Get("crawl"),
 		}
@@ -316,6 +533,7 @@ func handleResults(e *engine.Engine, tmpl *template.Template) http.HandlerFunc {
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
+		sortOrder := string(searcher.NormalizeSortOrder(r.URL.Query().Get("sort")))
 		page := 1
 		if p := r.URL.Query().Get("page"); p != "" {
 			if v, err := strconv.Atoi(p); err == nil {
@@ -330,7 +548,7 @@ func handleResults(e *engine.Engine, tmpl *template.Template) http.HandlerFunc {
 		}
 
 		offset := (page - 1) * pageSize
-		window := e.Search(query, offset+pageSize+1) // one extra detects a next page
+		window := e.SearchWithSort(query, offset+pageSize+1, sortOrder) // one extra detects a next page
 		hasNext := len(window) > offset+pageSize
 		switch {
 		case hasNext:
@@ -340,16 +558,23 @@ func handleResults(e *engine.Engine, tmpl *template.Template) http.HandlerFunc {
 		default:
 			window = nil
 		}
+		related := make(map[int][]searcher.Result, len(window))
+		if len(window) > 0 {
+			result := window[0]
+			related[result.ID] = e.Related(result.URL, 3)
+		}
 
 		data := map[string]interface{}{
 			"Query":   query,
+			"Sort":    sortOrder,
 			"Results": window,
+			"Related": related,
 			"Stats":   e.Stats(),
 			"Page":    page,
 			"HasPrev": page > 1,
 			"HasNext": hasNext,
-			"PrevURL": searchURL(query, page-1),
-			"NextURL": searchURL(query, page+1),
+			"PrevURL": searchURL(query, page-1, sortOrder),
+			"NextURL": searchURL(query, page+1, sortOrder),
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		render(w, tmpl, "results.html", data)
@@ -400,6 +625,49 @@ func handleCrawlStatus(e *engine.Engine) http.HandlerFunc {
 	}
 }
 
+func handleAPICrawlPause(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		e.Pause()
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "paused": true})
+	}
+}
+
+func handleAPICrawlResume(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		e.Resume()
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "paused": false})
+	}
+}
+
+func handleAPICrawlClear(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		e.ClearQueue()
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "queueSize": 0})
+	}
+}
+
+func handleAPICrawlRequeue(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if body.URL == "" {
+			writeJSONError(w, http.StatusBadRequest, "url required")
+			return
+		}
+		if !e.Requeue(body.URL) {
+			writeJSONError(w, http.StatusBadRequest, "url could not be requeued")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "url": crawler.NormalizeURL(body.URL)})
+	}
+}
+
 // handleSuggest serves term autocomplete. limit defaults to 5 and is clamped
 // to [1, 20].
 func handleSuggest(e *engine.Engine) http.HandlerFunc {
@@ -439,14 +707,16 @@ func handleAPIStatus(e *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		s := e.Stats()
 		writeJSON(w, http.StatusOK, struct {
-			App       string `json:"app"`
-			Version   string `json:"version"`
-			Documents int    `json:"documents"`
-			Terms     int    `json:"terms"`
-			Visited   int    `json:"visited"`
-			QueueSize int32  `json:"queueSize"`
-			Active    int32  `json:"active"`
-			Peers     int    `json:"peers"`
+			App       string                     `json:"app"`
+			Version   string                     `json:"version"`
+			Documents int                        `json:"documents"`
+			Terms     int                        `json:"terms"`
+			Visited   int                        `json:"visited"`
+			QueueSize int32                      `json:"queueSize"`
+			Active    int32                      `json:"active"`
+			Paused    bool                       `json:"paused"`
+			Peers     int                        `json:"peers"`
+			HostStats map[string]engine.HostStat `json:"hostStats,omitempty"`
 		}{
 			App:       "palspider",
 			Version:   version,
@@ -455,7 +725,9 @@ func handleAPIStatus(e *engine.Engine) http.HandlerFunc {
 			Visited:   s.Visited,
 			QueueSize: s.QueueSize,
 			Active:    s.Active,
+			Paused:    s.Paused,
 			Peers:     len(e.Peers.List()),
+			HostStats: s.HostStats,
 		})
 	}
 }
@@ -511,6 +783,46 @@ func handleAPIPeersRemove(e *engine.Engine) http.HandlerFunc {
 // limit is clamped to [1, 100] (default 10), offset must be < 100, and
 // remote=1 searches through the peer mesh as well. The response is always a
 // JSON array, empty when nothing matched.
+func filterSearchResults(results []searcher.Result, values url.Values) []searcher.Result {
+	hostFilter := strings.TrimSpace(strings.ToLower(values.Get("host")))
+	pathFilter := strings.TrimSpace(values.Get("path"))
+	if hostFilter == "" && pathFilter == "" {
+		return results
+	}
+
+	filtered := make([]searcher.Result, 0, len(results))
+	for _, res := range results {
+		if hostFilter != "" {
+			parsed, err := url.Parse(res.URL)
+			if err != nil {
+				continue
+			}
+			host := strings.Trim(strings.ToLower(parsed.Hostname()), ".")
+			hostFilterNorm := strings.Trim(strings.ToLower(hostFilter), ".")
+			if host != hostFilterNorm && !strings.HasSuffix(host, "."+hostFilterNorm) {
+				continue
+			}
+		}
+		if pathFilter != "" {
+			parsed, err := url.Parse(res.URL)
+			if err != nil {
+				continue
+			}
+			path := strings.TrimRight(parsed.EscapedPath(), "/")
+			want := strings.TrimRight(pathFilter, "/")
+			if path == "" {
+				if want != "" && want != "/" {
+					continue
+				}
+			} else if !strings.HasPrefix(path, want) {
+				continue
+			}
+		}
+		filtered = append(filtered, res)
+	}
+	return filtered
+}
+
 func handleAPISearch(e *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -547,13 +859,15 @@ func handleAPISearch(e *engine.Engine) http.HandlerFunc {
 			limit = 100 - offset
 		}
 
+		sortOrder := string(searcher.NormalizeSortOrder(r.URL.Query().Get("sort")))
 		window := offset + limit
 		var results []searcher.Result
 		if isRemoteSearch(r) {
-			results = e.Search(query, window)
+			results = e.SearchWithSort(query, window, sortOrder)
 		} else {
-			results = e.SearchLocal(query, window)
+			results = e.SearchLocalWithSort(query, window, sortOrder)
 		}
+		results = filterSearchResults(results, r.URL.Query())
 		if offset > 0 {
 			if len(results) <= offset {
 				results = nil
@@ -561,6 +875,39 @@ func handleAPISearch(e *engine.Engine) http.HandlerFunc {
 				results = results[offset:]
 			}
 		}
+		if results == nil {
+			results = []searcher.Result{}
+		}
+		w.Header().Set("X-Palspider-Count", strconv.Itoa(len(results)))
+		w.Header().Set("X-Palspider-Offset", strconv.Itoa(offset))
+		w.Header().Set("X-Palspider-Limit", strconv.Itoa(limit))
+		w.Header().Set("X-Palspider-Total", strconv.Itoa(len(filterSearchResults(e.SearchLocalWithSort(query, 100, sortOrder), r.URL.Query()))))
+		writeJSON(w, http.StatusOK, results)
+	}
+}
+
+func handleAPIRelated(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rawURL := strings.TrimSpace(r.URL.Query().Get("url"))
+		parsed, err := url.Parse(rawURL)
+		if err != nil || parsed.Host == "" ||
+			(!strings.EqualFold(parsed.Scheme, "http") && !strings.EqualFold(parsed.Scheme, "https")) {
+			writeJSONError(w, http.StatusBadRequest, "url must be an absolute http or https URL")
+			return
+		}
+		limit := 5
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			value, err := strconv.Atoi(raw)
+			if err != nil || value < 1 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be an integer >= 1")
+				return
+			}
+			limit = value
+			if limit > 20 {
+				limit = 20
+			}
+		}
+		results := e.Related(crawler.NormalizeURL(rawURL), limit)
 		if results == nil {
 			results = []searcher.Result{}
 		}
@@ -572,6 +919,45 @@ func handleAPISearch(e *engine.Engine) http.HandlerFunc {
 func isRemoteSearch(r *http.Request) bool {
 	v := r.URL.Query().Get("remote")
 	return v == "1" || strings.EqualFold(v, "true")
+}
+
+// handleAPIExport streams indexed documents as a paginated JSON array. limit
+// defaults to 100 and clamps to [1, exportMaxLimit]; offset must be >= 0.
+// Pagination totals are reported in the same X-Palspider-* headers as search.
+func handleAPIExport(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		limit := 100
+		if l := r.URL.Query().Get("limit"); l != "" {
+			v, err := strconv.Atoi(l)
+			if err != nil || v < 1 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be an integer >= 1")
+				return
+			}
+			if v > exportMaxLimit {
+				v = exportMaxLimit
+			}
+			limit = v
+		}
+		offset := 0
+		if o := r.URL.Query().Get("offset"); o != "" {
+			v, err := strconv.Atoi(o)
+			if err != nil || v < 0 {
+				writeJSONError(w, http.StatusBadRequest, "offset must be an integer >= 0")
+				return
+			}
+			offset = v
+		}
+
+		docs, total := e.ExportDocuments(offset, limit)
+		if docs == nil {
+			docs = []engine.ExportResult{}
+		}
+		w.Header().Set("X-Palspider-Count", strconv.Itoa(len(docs)))
+		w.Header().Set("X-Palspider-Offset", strconv.Itoa(offset))
+		w.Header().Set("X-Palspider-Limit", strconv.Itoa(limit))
+		w.Header().Set("X-Palspider-Total", strconv.Itoa(total))
+		writeJSON(w, http.StatusOK, docs)
+	}
 }
 
 func handleAPIPeersGossip(e *engine.Engine) http.HandlerFunc {

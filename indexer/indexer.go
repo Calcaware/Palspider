@@ -109,6 +109,21 @@ func (ix *Indexer) TermCount() int {
 	return len(ix.index)
 }
 
+// AllDocs returns a copy of every indexed document in ascending ID order.
+// Slots left empty by a sparse restore (an ID gap) are skipped.
+func (ix *Indexer) AllDocs() []Document {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	docs := make([]Document, 0, len(ix.docs))
+	for _, doc := range ix.docs {
+		if doc.URL == "" {
+			continue
+		}
+		docs = append(docs, doc)
+	}
+	return docs
+}
+
 // WalkTerms iterates the vocabulary under a single read lock, passing each
 // term and its document frequency to fn.
 func (ix *Indexer) WalkTerms(fn func(term string, df int)) {

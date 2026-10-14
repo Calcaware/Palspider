@@ -22,8 +22,10 @@ deduplicated by URL, and peer lists gossip automatically.
   endpoint. Set `PALSPIDER_ALLOW_PRIVATE=1` to crawl local hosts on purpose.
 - **Indexing** - in-memory inverted index (term -> doc ID -> term frequency)
   plus a URL trie scoped by host, used for URL clustering.
-- **Ranking** - TF-IDF scoring with in-degree link weighting, URL-depth bonus,
-  and sibling-cluster boost. No models, no embeddings.
+- **Ranking** - TF-IDF scoring with title and host match boosts, phrase and
+  proximity weighting, in-degree link weighting, URL-depth bonus, and
+  sibling-cluster boost. Query-focused snippets highlight matching terms.
+  No models, no embeddings.
 - **Autocomplete** - term suggestions ranked by document frequency,
   case-insensitive, debounced client-side.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
@@ -35,8 +37,8 @@ deduplicated by URL, and peer lists gossip automatically.
 - **Web UI** - Bootstrap 5 dark/light theme, live crawl stats, seed-URL
   dialog, peer management, paginated results (10 per page, 100 max), 404 page.
   Templates and assets are embedded in the binary (`embed.FS`).
-- **JSON API** - health, status, search (with offset paging), crawl, suggest,
-  peers, and gossip endpoints for scripting. Read-only endpoints are
+- **JSON API** - health, status, search (with offset paging), export, crawl,
+  suggest, peers, and gossip endpoints for scripting. Read-only endpoints are
   cross-origin readable; mutations are protected by optional basic auth.
   Full reference: [docs/API.md](docs/API.md).
 - **Optional auth** - set `PALSPIDER_AUTH=user:pass` and `POST`/`DELETE`
@@ -76,7 +78,12 @@ Everything is configured through environment variables:
 | `PALSPIDER_MAX_PAGES` | `0` | Stop queueing new pages after this many documents. `0` means unlimited. |
 | `PALSPIDER_DB` | `palspider.db` | Path to the bbolt database file. |
 | `PALSPIDER_ALLOW_PRIVATE` | unset | Set to `1` to allow crawling loopback and private-network hosts. |
+| `PALSPIDER_ALLOWLIST` | unset | Optional comma/semicolon-separated host allowlist (for example `example.com, *.example.org`). |
+| `PALSPIDER_DENYLIST` | unset | Optional comma/semicolon-separated host denylist that blocks matching domains even when the host is otherwise reachable. |
 | `PALSPIDER_AUTH` | unset | `user:pass` - require Basic credentials on `POST`/`DELETE` API routes. |
+| `PALSPIDER_PUBLIC_RATE_LIMIT` | unset | Optional per-IP GET request cap within a rolling 60-second window. Example: `60` allows 60 public GETs per minute before returning `429`. |
+| `PALSPIDER_PEER_TOKEN` | unset | Optional bearer token used for peer mesh search and gossip traffic. |
+| `PALSPIDER_PEER_ALLOWLIST` | unset | Optional comma/semicolon-separated peer host allowlist. If unset, any valid peer URL is accepted. |
 | `INQUEST_WORKERS`, `INQUEST_DB` | - | Old names, still accepted as a fallback. |
 
 ## How it works
@@ -116,7 +123,7 @@ Everything is configured through environment variables:
 | Path | Responsibility |
 |---|---|
 | `main.go` | Entrypoint: HTTP routes, HTML and JSON handlers, template parsing, seed data, graceful shutdown. |
-| `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving tag stripping), `ExtractLinks` (quoted and unquoted hrefs, script-safe), `NormalizeURL`, `Tokenize`, `ContentFingerprint`. |
+| `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL`, `Tokenize`, `ContentFingerprint`. |
 | `engine/` | Worker pool, URL queue with depth tracking, dedupe sets, persistence, local plus distributed search, stats. |
 | `indexer/` | `Indexer` (documents, inverted index, URL lookup) and `LinkStore` (in-degree counts per URL). |
 | `trie/` | Path-segment trie keyed by host: subtree doc IDs (cluster boost) and depth. |
@@ -209,6 +216,7 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `GET /api/health` | Liveness probe: `{"status":"ok","app":"palspider","version":...}` |
 | `GET /api/status` | `{"app","version","documents","terms","visited","queueSize","active","peers"}` |
 | `GET /api/search?q=...&limit=10&offset=0&remote=0` | Search results. `limit` clamps to [1, 100], `offset` must be < 100, `remote=1` fans out to peers. Always returns an array. |
+| `GET /api/export?limit=100&offset=0` | Paginated JSON export of indexed documents (`id`, `url`, `title`, `text`, `linkCount`). `limit` clamps to [1, 1000]. |
 | `GET /api/crawl` | Alias of `GET /crawl-status`. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
 | `GET /api/suggest?q=...&limit=5` | Alias of `GET /suggest`. |
@@ -244,8 +252,8 @@ go test -race ./... # same, with the race detector (needs CGO / gcc)
 
 The test suite covers URL normalization, text and link extraction, tokenizing,
 rate limiting, the private-address guard, trie concurrency, index bookkeeping,
-ranking and suggestions, batch persistence, result merging, and peer URL
-handling.
+ranking and suggestions, batch persistence, result merging, document export,
+and peer URL handling.
 
 ## Known issues
 
@@ -290,9 +298,7 @@ Things that are still wrong or missing after the current round of fixes:
     be skipped.
 13. **Peer scores are merged raw.** TF-IDF depends on each peer's corpus size,
     so scores from different nodes are not directly comparable.
-14. **HTML entities in titles are not decoded** (a title containing `&amp;`
-    will display literally), and link extraction still picks up anchors
-    inside HTML comments.
+14. Link extraction now ignores anchors inside HTML comments.
 
 ## Roadmap / possible features
 

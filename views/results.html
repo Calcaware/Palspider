@@ -27,6 +27,12 @@
         <form action="/search" method="GET" role="search">
           <div class="input-group">
             <input type="text" name="q" class="form-control" value="{{.Query}}" autofocus>
+            <select name="sort" class="form-select border-start-0" aria-label="Sort results" style="max-width: 160px;">
+              <option value="relevance" {{if eq .Sort "relevance"}}selected{{end}}>Relevance</option>
+              <option value="newest" {{if eq .Sort "newest"}}selected{{end}}>Newest</option>
+              <option value="oldest" {{if eq .Sort "oldest"}}selected{{end}}>Oldest</option>
+              <option value="most_linked" {{if eq .Sort "most_linked"}}selected{{end}}>Most linked</option>
+            </select>
             <button class="btn btn-light" type="submit">Search</button>
           </div>
         </form>
@@ -131,11 +137,19 @@
               <h5 class="mb-1">
                 <a href="{{.URL}}" class="text-light text-decoration-none">{{.Title}}</a>
               </h5>
-              <p class="text-secondary mb-1 small">{{snippet .Text 300}}</p>
+              <p class="text-secondary mb-1 small">{{highlightSnippet .Text $.Query 300}}</p>
               {{if .PeerSource}}
                 <span class="badge bg-success-subtle text-success-emphasis">peer</span>
               {{end}}
               <span class="badge bg-secondary-subtle text-secondary-emphasis">score: {{printf "%.2f" .Score}}</span>
+              {{with index $.Related .ID}}
+                <div class="small text-secondary mt-2">
+                  Related:
+                  {{range .}}
+                    <a href="{{.URL}}" class="link-secondary me-2">{{.Title}}</a>
+                  {{end}}
+                </div>
+              {{end}}
             </div>
           {{end}}
         </div>

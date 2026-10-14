@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,35 +40,51 @@ type Engine struct {
 	Store     *store.Store
 	limiter   *crawler.RateLimiter
 
-	workers   int
-	maxDepth  int
-	maxPages  int
-	urlChan   chan crawlItem
-	visited   map[string]struct{}
-	fpSeen    map[string]struct{}
-	pending   map[string]struct{}
-	mu        sync.Mutex
-	wg        sync.WaitGroup
-	active    int32
-	cancel    context.CancelFunc
-	queueSize int32
+	workers     int
+	maxDepth    int
+	maxPages    int
+	urlChan     chan crawlItem
+	visited     map[string]struct{}
+	fpSeen      map[string]struct{}
+	pending     map[string]struct{}
+	retryCounts map[string]int
+	retryAt     map[string]time.Time
+	hostStats   map[string]HostStat
+	paused      bool
+	mu          sync.Mutex
+	wg          sync.WaitGroup
+	active      int32
+	cancel      context.CancelFunc
+	queueSize   int32
+}
+
+type HostStat struct {
+	Requests  int    `json:"requests"`
+	Successes int    `json:"successes"`
+	Failures  int    `json:"failures"`
+	LastError string `json:"lastError,omitempty"`
+	LastSeen  string `json:"lastSeen,omitempty"`
 }
 
 type Stats struct {
-	Documents int   `json:"documents"`
-	Terms     int   `json:"terms"`
-	Visited   int   `json:"visited"`
-	QueueSize int32 `json:"queueSize"`
-	Active    int32 `json:"active"`
+	Documents int                 `json:"documents"`
+	Terms     int                 `json:"terms"`
+	Visited   int                 `json:"visited"`
+	QueueSize int32               `json:"queueSize"`
+	Active    int32               `json:"active"`
+	Paused    bool                `json:"paused"`
+	HostStats map[string]HostStat `json:"hostStats"`
 }
 
 type CrawlStatus struct {
-	QueueSize int32 `json:"queueSize"`
-	Active    int32 `json:"active"`
-	Crawling  bool  `json:"crawling"`
-	Visited   int   `json:"visited"`
-	Documents int   `json:"documents"`
-	Terms     int   `json:"terms"`
+	QueueSize int32               `json:"queueSize"`
+	Active    int32               `json:"active"`
+	Crawling  bool                `json:"crawling"`
+	Visited   int                 `json:"visited"`
+	Documents int                 `json:"documents"`
+	Terms     int                 `json:"terms"`
+	Paused    bool                `json:"paused"`
+	HostStats map[string]HostStat `json:"hostStats"`
 }
 
 // New creates an engine. maxDepth < 0 means unlimited crawl depth; maxPages
@@ -78,20 +95,23 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 	ls := indexer.NewLinkStore()
 
 	e := &Engine{
-		Indexer:   ix,
-		Trie:      tr,
-		Searcher:  searcher.New(ix, tr),
-		LinkStore: ls,
-		Peers:     peer.New(),
-		Store:     st,
-		limiter:   crawler.NewRateLimiter(200 * time.Millisecond),
-		workers:   workerCount,
-		maxDepth:  maxDepth,
-		maxPages:  maxPages,
-		urlChan:   make(chan crawlItem, 100000),
-		visited:   make(map[string]struct{}),
-		fpSeen:    make(map[string]struct{}),
-		pending:   make(map[string]struct{}),
+		Indexer:     ix,
+		Trie:        tr,
+		Searcher:    searcher.New(ix, tr),
+		LinkStore:   ls,
+		Peers:       peer.New(),
+		Store:       st,
+		limiter:     crawler.NewRateLimiter(200 * time.Millisecond),
+		workers:     workerCount,
+		maxDepth:    maxDepth,
+		maxPages:    maxPages,
+		urlChan:     make(chan crawlItem, 100000),
+		visited:     make(map[string]struct{}),
+		fpSeen:      make(map[string]struct{}),
+		pending:     make(map[string]struct{}),
+		retryCounts: make(map[string]int),
+		retryAt:     make(map[string]time.Time),
+		hostStats:   make(map[string]HostStat),
 	}
 	return e
 }
@@ -318,7 +338,11 @@ func (e *Engine) Stop() {
 }
 
 func (e *Engine) Search(query string, limit int) []searcher.Result {
-	localResults := e.Searcher.Search(query, limit)
+	return e.SearchWithSort(query, limit, "")
+}
+
+func (e *Engine) SearchWithSort(query string, limit int, rawSort string) []searcher.Result {
+	localResults := e.Searcher.SearchWithSort(query, limit, rawSort)
 
 	if e.Peers == nil || len(e.Peers.List()) == 0 {
 		return localResults
@@ -342,14 +366,65 @@ func (e *Engine) Search(query string, limit int) []searcher.Result {
 	case <-time.After(peerSearchBudget):
 	}
 
-	return mergeResults(localResults, remoteResults, limit)
+	return mergeResultsWithSort(localResults, remoteResults, limit, rawSort)
 }
 
 func (e *Engine) SearchLocal(query string, limit int) []searcher.Result {
 	return e.Searcher.Search(query, limit)
 }
 
+func (e *Engine) SearchLocalWithSort(query string, limit int, rawSort string) []searcher.Result {
+	return e.Searcher.SearchWithSort(query, limit, rawSort)
+}
+
+func (e *Engine) Related(rawURL string, limit int) []searcher.Result {
+	return e.Searcher.Related(rawURL, limit)
+}
+
+// ExportResult is one document in a JSON export. It mirrors the indexed
+// document without the internal bookkeeping fields.
+type ExportResult struct {
+	ID        int    `json:"id"`
+	URL       string `json:"url"`
+	Title     string `json:"title"`
+	Text      string `json:"text"`
+	LinkCount int    `json:"linkCount"`
+}
+
+// ExportDocuments returns indexed documents in ascending ID order, applying
+// offset and limit (limit <= 0 means no cap). The second return value is the
+// total number of indexed documents so callers can report pagination metadata.
+func (e *Engine) ExportDocuments(offset, limit int) ([]ExportResult, int) {
+	docs := e.Indexer.AllDocs()
+	total := len(docs)
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= total {
+		return nil, total
+	}
+	docs = docs[offset:]
+	if limit > 0 && limit < len(docs) {
+		docs = docs[:limit]
+	}
+	out := make([]ExportResult, len(docs))
+	for i, doc := range docs {
+		out[i] = ExportResult{
+			ID:        doc.ID,
+			URL:       doc.URL,
+			Title:     doc.Title,
+			Text:      doc.Text,
+			LinkCount: doc.LinkCount,
+		}
+	}
+	return out, total
+}
+
 func mergeResults(local, remote []searcher.Result, limit int) []searcher.Result {
+	return mergeResultsWithSort(local, remote, limit, string(searcher.SortRelevance))
+}
+
+func mergeResultsWithSort(local, remote []searcher.Result, limit int, rawSort string) []searcher.Result {
 	if limit <= 0 {
 		return nil
 	}
@@ -369,8 +444,33 @@ func mergeResults(local, remote []searcher.Result, limit int) []searcher.Result 
 		}
 	}
 
+	mode := searcher.NormalizeSortOrder(rawSort)
 	sort.Slice(results, func(i, j int) bool {
-		return results[i].Score > results[j].Score
+		switch mode {
+		case searcher.SortNewest:
+			if results[i].ID != results[j].ID {
+				return results[i].ID > results[j].ID
+			}
+		case searcher.SortOldest:
+			if results[i].ID != results[j].ID {
+				return results[i].ID < results[j].ID
+			}
+		case searcher.SortMostLinked:
+			if results[i].LinkCount != results[j].LinkCount {
+				return results[i].LinkCount > results[j].LinkCount
+			}
+		default:
+			if results[i].Score != results[j].Score {
+				return results[i].Score > results[j].Score
+			}
+		}
+		if results[i].Score != results[j].Score {
+			return results[i].Score > results[j].Score
+		}
+		if results[i].LinkCount != results[j].LinkCount {
+			return results[i].LinkCount > results[j].LinkCount
+		}
+		return results[i].ID < results[j].ID
 	})
 
 	if limit < len(results) {
@@ -383,9 +483,100 @@ func (e *Engine) Suggest(prefix string, limit int) []string {
 	return e.Searcher.Suggest(prefix, limit)
 }
 
+func (e *Engine) ClearQueue() {
+	for {
+		select {
+		case <-e.urlChan:
+		default:
+			goto done
+		}
+	}
+done:
+	e.mu.Lock()
+	for url := range e.pending {
+		delete(e.pending, url)
+	}
+	for url := range e.retryAt {
+		delete(e.retryAt, url)
+	}
+	e.mu.Unlock()
+	atomic.StoreInt32(&e.queueSize, 0)
+}
+
+func (e *Engine) Requeue(rawURL string) bool {
+	normalized := crawler.NormalizeURL(rawURL)
+	e.mu.Lock()
+	delete(e.retryAt, normalized)
+	delete(e.pending, normalized)
+	delete(e.visited, normalized)
+	if e.Store != nil {
+		e.Store.DeleteVisited(normalized)
+	}
+	e.mu.Unlock()
+	return e.enqueue(crawlItem{url: normalized, depth: 0}, 5*time.Second)
+}
+
+func (e *Engine) Pause() {
+	e.mu.Lock()
+	e.paused = true
+	e.mu.Unlock()
+}
+
+func (e *Engine) Resume() {
+	e.mu.Lock()
+	e.paused = false
+	e.mu.Unlock()
+}
+
+func (e *Engine) Paused() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.paused
+}
+
+func (e *Engine) HostStats() map[string]HostStat {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make(map[string]HostStat, len(e.hostStats))
+	for k, v := range e.hostStats {
+		out[k] = v
+	}
+	return out
+}
+
+func (e *Engine) recordHostStats(rawURL string, ok bool, err error) {
+	u, parseErr := url.Parse(rawURL)
+	host := ""
+	if parseErr == nil {
+		host = u.Hostname()
+	}
+	if host == "" {
+		return
+	}
+	e.mu.Lock()
+	stat := e.hostStats[host]
+	stat.Requests++
+	if ok {
+		stat.Successes++
+	} else {
+		stat.Failures++
+		if err != nil {
+			stat.LastError = err.Error()
+		}
+	}
+	stat.LastSeen = time.Now().Format(time.RFC3339)
+	e.hostStats[host] = stat
+	e.mu.Unlock()
+}
+
 func (e *Engine) Stats() Stats {
 	e.mu.Lock()
 	visited := len(e.visited)
+	paused := e.paused
+	hosts := make(map[string]HostStat, len(e.hostStats))
+	for k, v := range e.hostStats {
+		hosts[k] = v
+	}
 	e.mu.Unlock()
 	return Stats{
 		Documents: e.Indexer.DocCount(),
@@ -393,12 +584,19 @@ func (e *Engine) Stats() Stats {
 		Visited:   visited,
 		QueueSize: atomic.LoadInt32(&e.queueSize),
 		Active:    atomic.LoadInt32(&e.active),
+		Paused:    paused,
+		HostStats: hosts,
 	}
 }
 
 func (e *Engine) CrawlStatus() CrawlStatus {
 	e.mu.Lock()
 	visited := len(e.visited)
+	paused := e.paused
+	hosts := make(map[string]HostStat, len(e.hostStats))
+	for k, v := range e.hostStats {
+		hosts[k] = v
+	}
 	e.mu.Unlock()
 	queueSize := atomic.LoadInt32(&e.queueSize)
 	active := atomic.LoadInt32(&e.active)
@@ -409,6 +607,8 @@ func (e *Engine) CrawlStatus() CrawlStatus {
 		Visited:   visited,
 		Documents: e.Indexer.DocCount(),
 		Terms:     e.Indexer.TermCount(),
+		Paused:    paused,
+		HostStats: hosts,
 	}
 }
 
@@ -433,10 +633,56 @@ func (e *Engine) worker(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case item := <-e.urlChan:
+			if e.Paused() {
+				if !e.enqueue(item, 5*time.Second) {
+					e.mu.Lock()
+					delete(e.pending, item.url)
+					e.mu.Unlock()
+				}
+				continue
+			}
+			if delay := e.retryDelay(item.url); delay > 0 {
+				go func(it crawlItem, d time.Duration) {
+					timer := time.NewTimer(d)
+					defer timer.Stop()
+					<-timer.C
+					e.enqueue(it, 5*time.Second)
+				}(item, delay)
+				continue
+			}
 			e.markDequeued(item)
 			e.processURL(ctx, item)
 		}
 	}
+}
+
+func (e *Engine) retryDelay(rawURL string) time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	at, ok := e.retryAt[rawURL]
+	if !ok {
+		return 0
+	}
+	delay := time.Until(at)
+	if delay < 0 {
+		return 0
+	}
+	return delay
+}
+
+func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
+	if err == nil || strings.Contains(err.Error(), "blocked") || strings.Contains(err.Error(), "unsupported scheme") || strings.Contains(err.Error(), "invalid URL") || strings.Contains(err.Error(), "not allowed by policy") || strings.Contains(err.Error(), "robots.txt") {
+		return
+	}
+
+	e.mu.Lock()
+	e.retryCounts[rawURL]++
+	e.retryAt[rawURL] = time.Now().Add(time.Hour)
+	delete(e.visited, rawURL)
+	if e.Store != nil {
+		e.Store.DeleteVisited(rawURL)
+	}
+	e.mu.Unlock()
 }
 
 // markDequeued moves a URL from pending to visited so the "discovered" stat
@@ -444,6 +690,7 @@ func (e *Engine) worker(ctx context.Context) {
 func (e *Engine) markDequeued(item crawlItem) {
 	e.mu.Lock()
 	delete(e.pending, item.url)
+	delete(e.retryCounts, item.url)
 	_, known := e.visited[item.url]
 	if !known {
 		e.visited[item.url] = struct{}{}
@@ -462,11 +709,18 @@ func (e *Engine) processURL(ctx context.Context, item crawlItem) {
 
 	html, err := crawler.FetchContext(ctx, rawURL, e.limiter)
 	if err != nil {
+		e.recordHostStats(rawURL, false, err)
 		if ctx.Err() == nil {
 			log.Printf("crawl: %s: %v", rawURL, err)
+			e.scheduleRetry(rawURL, item.depth, err)
 		}
 		return
 	}
+	e.recordHostStats(rawURL, true, nil)
+	e.mu.Lock()
+	delete(e.retryCounts, rawURL)
+	delete(e.retryAt, rawURL)
+	e.mu.Unlock()
 
 	title, text := crawler.ExtractText(html)
 	if text != "" {
