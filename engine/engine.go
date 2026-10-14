@@ -442,6 +442,46 @@ func (e *Engine) ExportDocuments(offset, limit int) ([]ExportResult, int) {
 	return out, total
 }
 
+// SitemapEach streams the URLs of indexed documents in ascending ID order to
+// fn, so a sitemap can be written without materializing an extra copy of the
+// corpus. When host is non-empty only URLs whose hostname equals it or is a
+// subdomain of it are emitted. limit caps the number of URLs written
+// (limit <= 0 means no cap), but every matching document is still visited so
+// the returned total reflects all eligible URLs rather than just the page.
+func (e *Engine) SitemapEach(host string, limit int, fn func(rawURL string) error) (int, error) {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), ".")
+	total := 0
+	written := 0
+	for _, doc := range e.Indexer.AllDocs() {
+		if !hostMatchesURL(doc.URL, host) {
+			continue
+		}
+		total++
+		if limit > 0 && written >= limit {
+			continue
+		}
+		if err := fn(doc.URL); err != nil {
+			return total, err
+		}
+		written++
+	}
+	return total, nil
+}
+
+// hostMatchesURL reports whether rawURL belongs to host, matching the host
+// itself or any subdomain. An empty host matches every URL.
+func hostMatchesURL(rawURL, host string) bool {
+	if host == "" {
+		return true
+	}
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	got := strings.Trim(strings.ToLower(parsed.Hostname()), ".")
+	return got == host || strings.HasSuffix(got, "."+host)
+}
+
 func mergeResults(local, remote []searcher.Result, limit int) []searcher.Result {
 	return mergeResultsWithSort(local, remote, limit, string(searcher.SortRelevance))
 }

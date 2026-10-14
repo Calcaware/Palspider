@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -943,6 +944,64 @@ func TestAPIExportNDJSON(t *testing.T) {
 	if code, _, body := get(t, ts.URL+"/api/export?format=xml"); code != http.StatusBadRequest ||
 		!strings.Contains(body, "format must be json or ndjson") {
 		t.Fatalf("bad format = %d %q, want 400 validation error", code, body)
+	}
+}
+
+func TestSitemapEndpoint(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+	e.AddDocument("https://sitemap.example/page?a=1&b=2", "Query page", "sitemap query content")
+
+	code, ct, body := get(t, ts.URL+"/sitemap.xml")
+	if code != http.StatusOK {
+		t.Fatalf("GET /sitemap.xml status = %d, want 200", code)
+	}
+	if !strings.HasPrefix(ct, "application/xml") {
+		t.Fatalf("sitemap content-type = %q, want application/xml", ct)
+	}
+	if !strings.HasPrefix(body, xml.Header) {
+		t.Fatalf("sitemap must start with the XML declaration, got %q", body[:min(len(body), 60)])
+	}
+	if !strings.Contains(body, `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`) {
+		t.Fatalf("sitemap missing urlset root: %s", body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "</urlset>") {
+		t.Fatalf("sitemap must close the urlset element: %s", body)
+	}
+	if !strings.Contains(body, "<loc>https://nodejs.org/</loc>") {
+		t.Fatalf("sitemap missing seeded document: %s", body)
+	}
+	// Query separators must be XML-escaped inside <loc>.
+	if !strings.Contains(body, "a=1&amp;b=2") || strings.Contains(body, "a=1&b=2") {
+		t.Fatalf("sitemap did not escape the ampersand: %s", body)
+	}
+	// Every URL is wrapped in a <loc> element.
+	if counts := strings.Count(body, "<loc>"); counts != 8 {
+		t.Fatalf("sitemap emitted %d URLs, want 8", counts)
+	}
+
+	code, _, body = get(t, ts.URL+"/sitemap.xml?host=nodejs.org")
+	if code != http.StatusOK {
+		t.Fatalf("GET /sitemap.xml?host nodejs.org status = %d, want 200", code)
+	}
+	if !strings.Contains(body, "<loc>https://nodejs.org/</loc>") {
+		t.Fatalf("host-scoped sitemap missing nodejs.org: %s", body)
+	}
+	if strings.Contains(body, "expressjs.com") {
+		t.Fatalf("host-scoped sitemap leaked another host: %s", body)
+	}
+
+	code, _, body = get(t, ts.URL+"/sitemap.xml?limit=2")
+	if code != http.StatusOK {
+		t.Fatalf("GET /sitemap.xml?limit=2 status = %d, want 200", code)
+	}
+	if counts := strings.Count(body, "<loc>"); counts != 2 {
+		t.Fatalf("limited sitemap emitted %d URLs, want 2", counts)
+	}
+
+	code, _, body = get(t, ts.URL+"/sitemap.xml?limit=abc")
+	if code != http.StatusBadRequest || !strings.Contains(body, "limit must be an integer") {
+		t.Fatalf("bad sitemap limit = %d %q, want 400 validation error", code, body)
 	}
 }
 

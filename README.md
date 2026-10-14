@@ -28,6 +28,8 @@ deduplicated by URL, and peer lists gossip automatically.
   No models, no embeddings.
 - **Autocomplete** - term suggestions ranked by document frequency,
   case-insensitive, debounced client-side.
+- **Sitemap export** - `GET /sitemap.xml` streams every indexed URL as an XML
+  sitemap, optionally scoped to one host and its subdomains with `?host=`.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
   concurrently with a hard 2 s time budget, results merge deduplicated by URL,
   peer lists gossip on contact, and peers track last-seen status.
@@ -230,6 +232,13 @@ endpoint above requires matching Basic credentials (401 with a
 `WWW-Authenticate` header otherwise); `GET` endpoints stay open. Every error
 is `{"error":"..."}` with an appropriate status code.
 
+`GET /sitemap.xml?host=example.com&limit=5000` streams an XML sitemap
+(`application/xml`) of indexed document URLs in ascending ID order. `host` is
+optional and restricts the export to that host and its subdomains; `limit` is
+optional, must be at least `1`, and caps the number of URLs written (default
+and maximum `50000`, the sitemap protocol limit). An out-of-range or
+non-numeric `limit` returns `400`.
+
 Static assets: `GET /style.css` and `GET /palspider.png`.
 
 Examples:
@@ -302,7 +311,7 @@ Things that are still wrong or missing after the current round of fixes:
 
 ## Roadmap / possible features
 
-- robots.txt and sitemap support, per-host politeness queues, crawl logs with
+- robots.txt and sitemap ingestion, per-host politeness queues, crawl logs with
   fetch failure reasons.
 - A PageRank pass over the collected link graph to complement TF-IDF.
 - Phrase queries ("..."), exclusion (-term), stemming, query-term highlighting

@@ -5,8 +5,11 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"encoding/xml"
+	"fmt"
 	stdhtml "html"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -126,6 +129,7 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("POST /crawl", handleCrawl(e))
 	mux.HandleFunc("GET /crawl-status", handleCrawlStatus(e))
 	mux.HandleFunc("GET /suggest", handleSuggest(e))
+	mux.HandleFunc("GET /sitemap.xml", handleSitemap(e))
 
 	mux.HandleFunc("GET /api/health", handleAPIHealth())
 	mux.HandleFunc("GET /api/status", handleAPIStatus(e))
@@ -500,6 +504,10 @@ const (
 	// exportMaxLimit caps a single JSON export page so one request cannot
 	// buffer an unbounded slice of the corpus.
 	exportMaxLimit = 1000
+
+	// sitemapMaxURLs caps a single sitemap so a response stays within the
+	// 50,000 URL / 50 MB limit described by the sitemap protocol.
+	sitemapMaxURLs = 50000
 )
 
 // searchURL builds a results-page link for the given query, page, and sort order.
@@ -991,6 +999,51 @@ func handleAPIExport(e *engine.Engine) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, docs)
 	}
+}
+
+// handleSitemap streams an XML sitemap of indexed document URLs to the client.
+// The optional host parameter restricts the output to one host and its
+// subdomains, and limit caps the number of URLs (default and maximum
+// sitemapMaxURLs). The document set is streamed rather than buffered, so a
+// large index is written incrementally.
+func handleSitemap(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host := strings.TrimSpace(r.URL.Query().Get("host"))
+		limit := sitemapMaxURLs
+		if l := r.URL.Query().Get("limit"); l != "" {
+			v, err := strconv.Atoi(l)
+			if err != nil || v < 1 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be an integer >= 1")
+				return
+			}
+			if v < limit {
+				limit = v
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, xml.Header)
+		io.WriteString(w, `<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">`+"\n")
+		if _, err := e.SitemapEach(host, limit, func(rawURL string) error {
+			_, werr := fmt.Fprintf(w, "  <url><loc>%s</loc></url>\n", xmlEscape(rawURL))
+			return werr
+		}); err != nil {
+			// Headers are already committed, so a mid-stream write failure
+			// can only be logged.
+			log.Printf("sitemap: %v", err)
+		}
+		io.WriteString(w, "</urlset>\n")
+	}
+}
+
+// xmlEscape escapes text for inclusion in an XML document.
+func xmlEscape(s string) string {
+	var b strings.Builder
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		return stdhtml.EscapeString(s)
+	}
+	return b.String()
 }
 
 func handleAPIPeersGossip(e *engine.Engine) http.HandlerFunc {

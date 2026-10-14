@@ -1,9 +1,10 @@
 # Palspider HTTP API
 
 Palspider exposes a small, scriptable JSON API alongside its web UI. Every
-response is `application/json` with a `X-Content-Type-Options: nosniff`
+JSON response is `application/json` with a `X-Content-Type-Options: nosniff`
 header. Error responses use the shape `{"error":"<message>"}` with a non-2xx
-status code.
+status code. The one non-JSON endpoint is `GET /sitemap.xml`, which returns
+`application/xml`.
 
 This document describes version `0.2.0` of the API. Version is also reported
 at runtime by `GET /api/health`, `GET /api/status`, and the
@@ -237,6 +238,44 @@ curl 'http://localhost:3000/api/export?format=ndjson&limit=2&offset=0'
 ```json
 {"id":0,"url":"https://nodejs.org/","title":"Node.js","text":"Node.js is a JavaScript runtime built on V8...","linkCount":0}
 {"id":1,"url":"https://expressjs.com/","title":"Express.js","text":"Express is a minimal and flexible Node.js web application framework...","linkCount":0}
+```
+
+### `GET /sitemap.xml`
+
+Streams an XML sitemap of indexed document URLs. Unlike the JSON endpoints this
+route responds with `Content-Type: application/xml; charset=utf-8` and is not
+part of the `/api/` namespace. Documents are written in ascending document ID
+order and streamed as they are visited, so a large index is produced
+incrementally rather than buffered into one response string.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://nodejs.org/</loc></url>
+  <url><loc>https://expressjs.com/</loc></url>
+</urlset>
+```
+
+Query parameters:
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `host` | unset | any host name | Restricts output to this host and its subdomains, such as `example.com` or `docs.example.com`. Unset means every indexed URL. |
+| `limit` | `50000` | `1` to `50000` | Maximum number of URLs written. Values above `50000` are clamped; non-numeric or less than `1` are `400` errors. |
+
+URLs are XML-escaped inside `<loc>` (for example `&` becomes `&amp;`). Because
+the body streams, a mid-response write failure is logged rather than converted
+into an error status. The `host` filter matches the host exactly or any
+subdomain of it, and never matches a host that merely ends with the same
+characters (so `nota.com` does not match `?host=a.com`).
+
+The 50,000 URL cap matches the sitemap protocol's per-file limit. To enumerate
+a larger corpus, filter by `host` or page through `GET /api/export` instead.
+
+Example:
+
+```sh
+curl 'http://localhost:3000/sitemap.xml?host=nodejs.org'
 ```
 
 ### `GET /api/crawl` and `GET /crawl-status`

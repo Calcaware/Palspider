@@ -121,7 +121,7 @@ Tasks:
 
 ### 3.4 Data and admin features
 
-- [ ] Add sitemap generation.
+- [x] Add sitemap generation.
 - [x] Add JSON export of indexed documents or top results.
 - [x] Add streaming NDJSON export (with `format=ndjson`) so large corpora can be exported without buffering the whole page.
 - [ ] Add the ability to delete or reindex specific domains.

@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -192,6 +193,66 @@ func TestExportEachStreamsAndPaginates(t *testing.T) {
 
 	if got := e.ExportTotal(); got != 3 {
 		t.Fatalf("ExportTotal = %d, want 3", got)
+	}
+}
+
+func TestSitemapEachStreamsAndFiltersByHost(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.AddDocument("https://a.com/page", "A", "alpha")
+	e.AddDocument("https://docs.a.com/guide", "Docs", "beta")
+	e.AddDocument("https://b.com/page", "B", "gamma")
+	e.AddDocument("https://nota.com/page", "N", "delta")
+
+	var urls []string
+	total, err := e.SitemapEach("a.com", 0, func(rawURL string) error {
+		urls = append(urls, rawURL)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SitemapEach: %v", err)
+	}
+	if total != 2 {
+		t.Fatalf("SitemapEach total = %d, want 2 (a.com and subdomains)", total)
+	}
+	if len(urls) != 2 {
+		t.Fatalf("SitemapEach wrote %d urls, want 2: %v", len(urls), urls)
+	}
+	for _, u := range urls {
+		if !strings.Contains(u, "a.com") {
+			t.Errorf("SitemapEach emitted %q outside host a.com", u)
+		}
+	}
+
+	// limit caps the writes but the total still reflects every match.
+	urls = nil
+	total, err = e.SitemapEach("a.com", 1, func(rawURL string) error {
+		urls = append(urls, rawURL)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SitemapEach limit: %v", err)
+	}
+	if total != 2 || len(urls) != 1 {
+		t.Fatalf("SitemapEach(limit=1) = %d urls / total %d, want 1 / 2", len(urls), total)
+	}
+
+	// An empty host matches every indexed URL.
+	urls = nil
+	total, err = e.SitemapEach("", 0, func(rawURL string) error {
+		urls = append(urls, rawURL)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("SitemapEach all: %v", err)
+	}
+	if total != 4 || len(urls) != 4 {
+		t.Fatalf("SitemapEach(all) = %d urls / total %d, want 4 / 4", len(urls), total)
+	}
+
+	// A callback error stops the walk and is returned to the caller.
+	sentinel := errors.New("stop")
+	if _, err := e.SitemapEach("", 0, func(string) error { return sentinel }); !errors.Is(err, sentinel) {
+		t.Fatalf("SitemapEach error = %v, want sentinel", err)
 	}
 }
 
