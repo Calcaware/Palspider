@@ -170,7 +170,7 @@ cosine similarity.
 ### `GET /api/export`
 
 Exports indexed documents in ascending document ID order. Useful for backups,
-migrations, and offline analysis. The response is always a JSON array, even
+migrations, and offline analysis. The default response is a JSON array, even
 when no documents are indexed (an empty array `[]`).
 
 Query parameters:
@@ -179,10 +179,19 @@ Query parameters:
 |---|---|---|---|
 | `limit` | `100` | `1` to `1000` | Maximum documents to return. Values above `1000` are clamped; non-numeric or less than `1` are `400` errors. |
 | `offset` | `0` | `>= 0` | Number of documents to skip. Negative or non-numeric values are `400` errors. |
+| `format` | `json` | `json` or `ndjson` | `json` returns a single array; `ndjson` streams one compact document object per line (`Content-Type: application/x-ndjson`). Any other value is a `400` error. |
 
 Pagination metadata is reported in the same response headers as
 `GET /api/search`: `X-Palspider-Count`, `X-Palspider-Offset`,
-`X-Palspider-Limit`, and `X-Palspider-Total`.
+`X-Palspider-Limit`, and `X-Palspider-Total`. When `format=ndjson` the headers
+are written before the body streams, so `X-Palspider-Count` is the number of
+rows the request will emit.
+
+The `ndjson` format is intended for large corpora: each document is encoded and
+written to the response as it is visited instead of being collected into a
+single array, so clients can consume the export incrementally and the server
+does not hold the whole page in memory. Combine it with `offset` to page
+through a corpus larger than the `limit` cap.
 
 Each document object uses these fields:
 
@@ -217,6 +226,17 @@ curl 'http://localhost:3000/api/export?limit=2&offset=0'
     "linkCount": 0
   }
 ]
+```
+
+Stream the same documents one per line:
+
+```sh
+curl 'http://localhost:3000/api/export?format=ndjson&limit=2&offset=0'
+```
+
+```json
+{"id":0,"url":"https://nodejs.org/","title":"Node.js","text":"Node.js is a JavaScript runtime built on V8...","linkCount":0}
+{"id":1,"url":"https://expressjs.com/","title":"Express.js","text":"Express is a minimal and flexible Node.js web application framework...","linkCount":0}
 ```
 
 ### `GET /api/crawl` and `GET /crawl-status`

@@ -870,6 +870,82 @@ func TestAPIExport(t *testing.T) {
 	}
 }
 
+func TestAPIExportNDJSON(t *testing.T) {
+	ts, done := newTestServer(t)
+	defer done()
+
+	resp := getResp(t, ts.URL+"/api/export?format=ndjson")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/export?format=ndjson status = %d, want 200", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/x-ndjson") {
+		t.Fatalf("ndjson content-type = %q, want application/x-ndjson", ct)
+	}
+	if got := resp.Header.Get("X-Palspider-Total"); got != "7" {
+		t.Fatalf("X-Palspider-Total = %q, want 7", got)
+	}
+	if got := resp.Header.Get("X-Palspider-Count"); got != "7" {
+		t.Fatalf("X-Palspider-Count = %q, want 7", got)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	text := strings.TrimRight(string(body), "\n")
+	if strings.HasPrefix(strings.TrimSpace(text), "[") {
+		t.Fatalf("ndjson body must not be a JSON array: %q", text)
+	}
+	lines := strings.Split(text, "\n")
+	if len(lines) != 7 {
+		t.Fatalf("ndjson lines = %d, want 7 (%q)", len(lines), text)
+	}
+	prevID := -1
+	for i, line := range lines {
+		var doc struct {
+			ID    int    `json:"id"`
+			URL   string `json:"url"`
+			Title string `json:"title"`
+		}
+		if err := json.Unmarshal([]byte(line), &doc); err != nil {
+			t.Fatalf("line %d is not valid JSON: %v (%q)", i, err, line)
+		}
+		if doc.URL == "" || doc.Title == "" {
+			t.Fatalf("line %d missing url/title: %q", i, line)
+		}
+		if doc.ID <= prevID {
+			t.Fatalf("line %d id %d not ascending after %d", i, doc.ID, prevID)
+		}
+		prevID = doc.ID
+	}
+
+	resp = getResp(t, ts.URL+"/api/export?format=ndjson&limit=2&offset=1")
+	body, _ = io.ReadAll(resp.Body)
+	if got := resp.Header.Get("X-Palspider-Count"); got != "2" {
+		t.Fatalf("paged X-Palspider-Count = %q, want 2", got)
+	}
+	resp.Body.Close()
+	lines = strings.Split(strings.TrimRight(string(body), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("paged ndjson lines = %d, want 2 (%q)", len(lines), body)
+	}
+	var first struct {
+		ID int `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil || first.ID != 1 {
+		t.Fatalf("paged ndjson first id = %d (err %v), want 1", first.ID, err)
+	}
+
+	resp = getResp(t, ts.URL+"/api/export?format=ndjson&offset=99")
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(strings.TrimSpace(string(body))) != 0 {
+		t.Fatalf("out-of-range ndjson body = %q, want empty", body)
+	}
+
+	if code, _, body := get(t, ts.URL+"/api/export?format=xml"); code != http.StatusBadRequest ||
+		!strings.Contains(body, "format must be json or ndjson") {
+		t.Fatalf("bad format = %d %q, want 400 validation error", code, body)
+	}
+}
+
 func TestHighlightSnippetSelectsRelevantTextAndEscapesHTML(t *testing.T) {
 	got := string(highlightSnippet("opening text with unrelated words, then Search Engine appears near the end", "search engine", 42))
 	if !strings.Contains(got, "<mark>Search</mark> <mark>Engine</mark>") {

@@ -391,32 +391,54 @@ type ExportResult struct {
 	LinkCount int    `json:"linkCount"`
 }
 
-// ExportDocuments returns indexed documents in ascending ID order, applying
-// offset and limit (limit <= 0 means no cap). The second return value is the
-// total number of indexed documents so callers can report pagination metadata.
-func (e *Engine) ExportDocuments(offset, limit int) ([]ExportResult, int) {
+// ExportTotal returns the number of indexed documents available for export.
+func (e *Engine) ExportTotal() int {
+	return e.Indexer.LiveDocCount()
+}
+
+// ExportEach streams indexed documents in ascending ID order to fn, applying
+// offset and limit (limit <= 0 means no cap). The returned value is the total
+// number of indexed documents so callers can report pagination metadata.
+//
+// Documents are handed to fn one at a time instead of being collected into a
+// slice, so a streaming format such as NDJSON can be written without
+// materializing the whole page in memory.
+func (e *Engine) ExportEach(offset, limit int, fn func(ExportResult) error) (int, error) {
 	docs := e.Indexer.AllDocs()
 	total := len(docs)
 	if offset < 0 {
 		offset = 0
 	}
 	if offset >= total {
-		return nil, total
+		return total, nil
 	}
 	docs = docs[offset:]
 	if limit > 0 && limit < len(docs) {
 		docs = docs[:limit]
 	}
-	out := make([]ExportResult, len(docs))
-	for i, doc := range docs {
-		out[i] = ExportResult{
+	for _, doc := range docs {
+		if err := fn(ExportResult{
 			ID:        doc.ID,
 			URL:       doc.URL,
 			Title:     doc.Title,
 			Text:      doc.Text,
 			LinkCount: doc.LinkCount,
+		}); err != nil {
+			return total, err
 		}
 	}
+	return total, nil
+}
+
+// ExportDocuments returns indexed documents in ascending ID order, applying
+// offset and limit (limit <= 0 means no cap). The second return value is the
+// total number of indexed documents so callers can report pagination metadata.
+func (e *Engine) ExportDocuments(offset, limit int) ([]ExportResult, int) {
+	var out []ExportResult
+	total, _ := e.ExportEach(offset, limit, func(doc ExportResult) error {
+		out = append(out, doc)
+		return nil
+	})
 	return out, total
 }
 

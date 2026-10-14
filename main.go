@@ -921,9 +921,10 @@ func isRemoteSearch(r *http.Request) bool {
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
-// handleAPIExport streams indexed documents as a paginated JSON array. limit
-// defaults to 100 and clamps to [1, exportMaxLimit]; offset must be >= 0.
-// Pagination totals are reported in the same X-Palspider-* headers as search.
+// handleAPIExport streams indexed documents. limit defaults to 100 and clamps
+// to [1, exportMaxLimit]; offset must be >= 0. format defaults to json and may
+// be ndjson to stream one document per line. Pagination totals are reported in
+// the same X-Palspider-* headers as search.
 func handleAPIExport(e *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		limit := 100
@@ -947,15 +948,47 @@ func handleAPIExport(e *engine.Engine) http.HandlerFunc {
 			}
 			offset = v
 		}
-
-		docs, total := e.ExportDocuments(offset, limit)
-		if docs == nil {
-			docs = []engine.ExportResult{}
+		format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+		if format == "" {
+			format = "json"
 		}
-		w.Header().Set("X-Palspider-Count", strconv.Itoa(len(docs)))
+		if format != "json" && format != "ndjson" {
+			writeJSONError(w, http.StatusBadRequest, "format must be json or ndjson")
+			return
+		}
+
+		total := e.ExportTotal()
+		count := 0
+		if offset < total {
+			count = total - offset
+			if count > limit {
+				count = limit
+			}
+		}
+		w.Header().Set("X-Palspider-Count", strconv.Itoa(count))
 		w.Header().Set("X-Palspider-Offset", strconv.Itoa(offset))
 		w.Header().Set("X-Palspider-Limit", strconv.Itoa(limit))
 		w.Header().Set("X-Palspider-Total", strconv.Itoa(total))
+
+		if format == "ndjson" {
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			enc := json.NewEncoder(w)
+			enc.SetEscapeHTML(false)
+			if _, err := e.ExportEach(offset, limit, func(doc engine.ExportResult) error {
+				return enc.Encode(doc)
+			}); err != nil {
+				// Headers are already committed, so a write failure can only
+				// be logged rather than turned into an error response.
+				log.Printf("export ndjson: %v", err)
+			}
+			return
+		}
+
+		docs, _ := e.ExportDocuments(offset, limit)
+		if docs == nil {
+			docs = []engine.ExportResult{}
+		}
 		writeJSON(w, http.StatusOK, docs)
 	}
 }

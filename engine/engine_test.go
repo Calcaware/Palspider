@@ -156,6 +156,45 @@ func TestExportDocumentsPaginates(t *testing.T) {
 	}
 }
 
+func TestExportEachStreamsAndPaginates(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.AddDocument("https://a.com/page", "A", "alpha")
+	e.AddDocument("https://b.com/page", "B", "beta")
+	e.AddDocument("https://c.com/page", "C", "gamma")
+
+	var got []ExportResult
+	total, err := e.ExportEach(1, 1, func(doc ExportResult) error {
+		got = append(got, doc)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("ExportEach: %v", err)
+	}
+	if total != 3 || len(got) != 1 || got[0].URL != "https://b.com/page" {
+		t.Fatalf("ExportEach(1,1) = %+v / total %d, want b.com / 3", got, total)
+	}
+
+	stop := errors.New("stop")
+	count := 0
+	total, err = e.ExportEach(0, 0, func(ExportResult) error {
+		count++
+		return stop
+	})
+	if !errors.Is(err, stop) {
+		t.Fatalf("ExportEach error = %v, want stop", err)
+	}
+	if count != 1 {
+		t.Fatalf("callback called %d times after error, want 1", count)
+	}
+	if total != 3 {
+		t.Fatalf("ExportEach total after error = %d, want 3", total)
+	}
+
+	if got := e.ExportTotal(); got != 3 {
+		t.Fatalf("ExportTotal = %d, want 3", got)
+	}
+}
+
 func TestScheduleRetryDefersFailuresForOneHour(t *testing.T) {
 	e := New(1, 10, 0, nil)
 	url := "https://example.com/retry"

@@ -216,7 +216,7 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `GET /api/health` | Liveness probe: `{"status":"ok","app":"palspider","version":...}` |
 | `GET /api/status` | `{"app","version","documents","terms","visited","queueSize","active","peers"}` |
 | `GET /api/search?q=...&limit=10&offset=0&remote=0` | Search results. `limit` clamps to [1, 100], `offset` must be < 100, `remote=1` fans out to peers. Always returns an array. |
-| `GET /api/export?limit=100&offset=0` | Paginated JSON export of indexed documents (`id`, `url`, `title`, `text`, `linkCount`). `limit` clamps to [1, 1000]. |
+| `GET /api/export?limit=100&offset=0&format=json` | Paginated export of indexed documents (`id`, `url`, `title`, `text`, `linkCount`). `limit` clamps to [1, 1000]; `format=ndjson` streams one document per line. |
 | `GET /api/crawl` | Alias of `GET /crawl-status`. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
 | `GET /api/suggest?q=...&limit=5` | Alias of `GET /suggest`. |
@@ -252,8 +252,8 @@ go test -race ./... # same, with the race detector (needs CGO / gcc)
 
 The test suite covers URL normalization, text and link extraction, tokenizing,
 rate limiting, the private-address guard, trie concurrency, index bookkeeping,
-ranking and suggestions, batch persistence, result merging, document export,
-and peer URL handling.
+ranking and suggestions, batch persistence, result merging, document export
+(JSON and streaming NDJSON), and peer URL handling.
 
 ## Known issues
 

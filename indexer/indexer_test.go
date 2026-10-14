@@ -85,6 +85,18 @@ func TestRestoreDocumentHandlesGaps(t *testing.T) {
 	}
 }
 
+func TestLiveDocCountSkipsSparseSlots(t *testing.T) {
+	ix := New()
+	ix.AddDocument("https://a.com/1", "One", "first", []string{"first"})
+	ix.RestoreDocument(Document{ID: 4, URL: "https://a.com/4", Title: "Four", Text: "fourth"})
+	if ix.DocCount() != 5 {
+		t.Errorf("DocCount = %d, want 5 (slice sized to ID)", ix.DocCount())
+	}
+	if got := ix.LiveDocCount(); got != 2 {
+		t.Errorf("LiveDocCount = %d, want 2 (sparse slots skipped)", got)
+	}
+}
+
 func TestSetLinkCountBounds(t *testing.T) {
 	ix := New()
 	id := ix.AddDocument("u", "t", "text", []string{"text"})

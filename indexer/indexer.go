@@ -124,6 +124,20 @@ func (ix *Indexer) AllDocs() []Document {
 	return docs
 }
 
+// LiveDocCount returns the number of indexed documents, skipping empty slots
+// left by a sparse restore. Unlike DocCount it reflects only exportable rows.
+func (ix *Indexer) LiveDocCount() int {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	n := 0
+	for _, doc := range ix.docs {
+		if doc.URL != "" {
+			n++
+		}
+	}
+	return n
+}
+
 // WalkTerms iterates the vocabulary under a single read lock, passing each
 // term and its document frequency to fn.
 func (ix *Indexer) WalkTerms(fn func(term string, df int)) {

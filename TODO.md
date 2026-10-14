@@ -123,7 +123,7 @@ Tasks:
 
 - [ ] Add sitemap generation.
 - [x] Add JSON export of indexed documents or top results.
-- [ ] Add streaming NDJSON export (with `format=ndjson`) so large corpora can be exported without buffering the whole page.
+- [x] Add streaming NDJSON export (with `format=ndjson`) so large corpora can be exported without buffering the whole page.
 - [ ] Add the ability to delete or reindex specific domains.
 - [ ] Add crawl snapshots and resume support after crashes.
 - [ ] Add a database integrity check and maintenance command.
