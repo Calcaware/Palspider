@@ -30,7 +30,7 @@ type scoredRelated struct {
 type SortMode string
 
 const (
-	SortRelevance SortMode = "relevance"
+	SortRelevance  SortMode = "relevance"
 	SortNewest     SortMode = "newest"
 	SortOldest     SortMode = "oldest"
 	SortMostLinked SortMode = "most_linked"
@@ -462,8 +462,9 @@ func (s *Searcher) Related(rawURL string, limit int) []Result {
 // Suggest returns up to limit suggestions for the given prefix. Suggestions
 // combine vocabulary completions for the last token (most common first),
 // multi-word completions when the caller has already typed more than one word,
-// and domain hints taken from indexed URLs. Comparison is case-insensitive and
-// the result is always a non-nil slice.
+// and domain hints taken from indexed URLs. Term and domain hints come from
+// the indexer prefix index, while phrase completions still scan documents.
+// Comparison is case-insensitive and the result is always a non-nil slice.
 func (s *Searcher) Suggest(prefix string, limit int) []string {
 	lower := strings.ToLower(strings.TrimSpace(prefix))
 	if lower == "" || limit <= 0 {
@@ -490,22 +491,15 @@ func (s *Searcher) Suggest(prefix string, limit int) []string {
 	}
 
 	if len(preceding) == 0 {
-		// Single word: complete the term from the vocabulary and add hosts
-		// from the index that begin with the same text.
-		s.ix.WalkTerms(func(term string, df int) {
-			if strings.HasPrefix(term, lastTerm) {
-				add(term, df)
-			}
-		})
-		for _, doc := range s.ix.AllDocs() {
-			parsed, err := url.Parse(doc.URL)
-			if err != nil {
-				continue
-			}
-			host := strings.ToLower(strings.Trim(parsed.Hostname(), "."))
-			if host != "" && strings.HasPrefix(host, lastTerm) {
-				add(host, 1)
-			}
+		// Single word: complete the term from the prefix index and add hosts
+		// from the same index. Both lists arrive trimmed to limit, which is
+		// enough because a candidate that misses the top of its own list
+		// cannot make the top of the merged list either.
+		for _, match := range s.ix.TermsWithPrefix(lastTerm, limit) {
+			add(match.Text, match.Weight)
+		}
+		for _, match := range s.ix.HostsWithPrefix(lastTerm, limit) {
+			add(match.Text, match.Weight)
 		}
 	} else {
 		// Multiple words: only complete documents that already contain every

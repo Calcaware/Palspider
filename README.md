@@ -21,16 +21,17 @@ deduplicated by URL, and peer lists gossip automatically.
   by default so a malicious seed URL cannot probe your LAN or cloud metadata
   endpoint. Set `PALSPIDER_ALLOW_PRIVATE=1` to crawl local hosts on purpose.
 - **Indexing** - in-memory inverted index (term -> doc ID -> term frequency)
-  plus a URL trie scoped by host, used for URL clustering.
+  plus a URL trie scoped by host, used for URL clustering, and prefix tries
+  over terms and host names that answer autocomplete lookups.
 - **Ranking** - TF-IDF scoring with title and host match boosts, phrase and
   proximity weighting, in-degree link weighting, URL-depth bonus, and
   sibling-cluster boost. Query-focused snippets highlight matching terms.
   No models, no embeddings.
 - **Autocomplete** - suggestions ranked by document frequency, available
-  case-insensitively and debounced client-side. Completes single terms, entire
-  phrases once more than one word has been typed (for example `search eng` ->
-  `search engine`), and surfaces matching host names from the index as domain
-  hints.
+  case-insensitively and debounced client-side. Term and host name hints come
+  from the prefix tries, and once more than one word has been typed whole
+  phrases are completed from the documents that contain the earlier words (for
+  example `search eng` -> `search engine`).
 - **Sitemap export** - `GET /sitemap.xml` streams every indexed URL as an XML
   sitemap, optionally scoped to one host and its subdomains with `?host=`.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
@@ -85,6 +86,7 @@ Everything is configured through environment variables:
 | `PALSPIDER_ALLOW_PRIVATE` | unset | Set to `1` to allow crawling loopback and private-network hosts. |
 | `PALSPIDER_ALLOWLIST` | unset | Optional comma/semicolon-separated host allowlist (for example `example.com, *.example.org`). |
 | `PALSPIDER_DENYLIST` | unset | Optional comma/semicolon-separated host denylist that blocks matching domains even when the host is otherwise reachable. |
+| `PALSPIDER_ALLOW_ROBOTS` | `1` | Set to `0` to ignore `robots.txt` rules and crawl disallowed paths anyway. |
 | `PALSPIDER_AUTH` | unset | `user:pass` - require Basic credentials on `POST`/`DELETE` API routes. |
 | `PALSPIDER_PUBLIC_RATE_LIMIT` | unset | Optional per-IP GET request cap within a rolling 60-second window. Example: `60` allows 60 public GETs per minute before returning `429`. |
 | `PALSPIDER_PEER_TOKEN` | unset | Optional bearer token used for peer mesh search and gossip traffic. |
@@ -130,7 +132,7 @@ Everything is configured through environment variables:
 | `main.go` | Entrypoint: HTTP routes, HTML and JSON handlers, template parsing, seed data, graceful shutdown. |
 | `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL`, `Tokenize`, `ContentFingerprint`. |
 | `engine/` | Worker pool, URL queue with depth tracking, dedupe sets, persistence, local plus distributed search, stats. |
-| `indexer/` | `Indexer` (documents, inverted index, URL lookup) and `LinkStore` (in-degree counts per URL). |
+| `indexer/` | `Indexer` (documents, inverted index, URL lookup, prefix tries for autocomplete) and `LinkStore` (in-degree counts per URL). |
 | `trie/` | Path-segment trie keyed by host: subtree doc IDs (cluster boost) and depth. |
 | `searcher/` | TF-IDF ranking with boosts; prefix autocomplete. |
 | `store/` | Thin bbolt wrapper: documents, postings, link counts, visited, fingerprints, metadata, single-transaction batch writes. |
@@ -264,16 +266,17 @@ go test -race ./... # same, with the race detector (needs CGO / gcc)
 
 The test suite covers URL normalization, text and link extraction, tokenizing,
 rate limiting, the private-address guard, trie concurrency, index bookkeeping,
-ranking and suggestions, batch persistence, result merging, document export
-(JSON and streaming NDJSON), and peer URL handling.
+prefix lookups, ranking and suggestions, batch persistence, result merging,
+document export (JSON and streaming NDJSON), and peer URL handling.
 
 ## Known issues
 
 Things that are still wrong or missing after the current round of fixes:
 
-1. **No robots.txt support.** The crawler does not read `robots.txt` or
-   sitemaps, and there is no per-host politeness delay beyond the fixed
-   200 ms limiter.
+1. **No sitemap ingestion.** The crawler honors `robots.txt` (set
+   `PALSPIDER_ALLOW_ROBOTS=0` to ignore it), but it does not read `sitemap.xml`
+   files, and there is no per-host politeness delay beyond the fixed 200 ms
+   limiter.
 2. **Everything lives in RAM.** All documents and postings are held in memory,
    so a big crawl grows without bound. `PALSPIDER_MAX_PAGES` is the only
    brake.
@@ -287,9 +290,9 @@ Things that are still wrong or missing after the current round of fixes:
 5. **Gossip is O(n^2) in the worst case.** Each newly learned peer costs one
    validation request, and knowledge transitive floods through the mesh. The
    in-flight guard prevents duplicates, not the total volume.
-6. **Autocomplete scans the whole vocabulary** on every keystroke (no term
-   trie yet), and multi-word or domain-hint suggestions also walk every indexed
-   document. The URL trie is a different structure.
+6. **Phrase suggestions walk every indexed document.** Term and host name
+   hints are served from the prefix tries, but multi-word completions still
+   tokenize each document to find pages that contain every preceding word.
 7. **Dead peers are marked but never removed.** A search may still spend up to
    its 2 s budget waiting on an unreachable peer before falling back to local
    results.
@@ -320,7 +323,6 @@ Things that are still wrong or missing after the current round of fixes:
 - A PageRank pass over the collected link graph to complement TF-IDF.
 - Phrase queries ("..."), exclusion (-term), stemming, query-term highlighting
   in snippets, and `site:` style operators.
-- A dedicated prefix trie for autocomplete instead of the linear scan.
 - Asynchronous peer fan-out that streams results as they arrive and gives up
   cleanly when the budget expires.
 - Peer health checks with automatic eviction, plus a persisted peer list.

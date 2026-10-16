@@ -323,6 +323,10 @@ body is not valid JSON or the URL is not acceptable.
 Note: like the web form, this endpoint respects the crawler's private-address
 guard. Seeding a loopback or link-local URL succeeds (it is queued) but the
 worker logs `blocked address` and skips it unless `PALSPIDER_ALLOW_PRIVATE=1`.
+Seeding also applies the host policy up front: a host outside
+`PALSPIDER_ALLOWLIST` or inside `PALSPIDER_DENYLIST` is rejected with a `400`,
+and paths that `robots.txt` disallows are skipped by the worker and logged
+instead of retried (set `PALSPIDER_ALLOW_ROBOTS=0` to ignore robots rules).
 
 ### `GET /api/suggest` and `GET /suggest`
 
@@ -338,6 +342,10 @@ together in one list:
   document.
 - **Domain hints** - host names from indexed URLs that begin with the typed
   token.
+
+Term and domain hints are answered from prefix tries maintained over the
+vocabulary and over the indexed host names, so a request walks only the entries
+that match the typed prefix.
 
 Query parameters:
 

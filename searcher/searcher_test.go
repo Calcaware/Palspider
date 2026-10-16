@@ -1,6 +1,7 @@
 package searcher
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/calcaware/palspider/crawler"
@@ -251,4 +252,59 @@ func TestSuggestCompletesMultiWordPhrases(t *testing.T) {
 			t.Fatalf("Suggest(search eng) = %v, leaked a suggestion from an unrelated document", got)
 		}
 	}
+}
+
+func TestSuggestRanksTermsAndHostsTogether(t *testing.T) {
+	s, ix := newSearcher()
+	addDoc(ix, "https://nodehive.example/1", "node node node")
+	addDoc(ix, "https://nodehive.example/2", "node")
+	addDoc(ix, "https://nodehive.example/3", "node")
+	addDoc(ix, "https://elsewhere.example/", "nodes")
+
+	// The host has three documents, so it edges out the weaker term even
+	// though the term list and the host list are looked up separately.
+	if got := s.Suggest("nod", 2); !sameStrings(got, []string{"node", "nodehive.example"}) {
+		t.Fatalf("Suggest(nod, 2) = %v, want node then nodehive.example", got)
+	}
+	if got := s.Suggest("nod", 1); !sameStrings(got, []string{"node"}) {
+		t.Errorf("Suggest(nod, 1) = %v, want the most frequent term", got)
+	}
+}
+
+func TestSuggestReturnsHostHintForHostPrefix(t *testing.T) {
+	s, ix := newSearcher()
+	addDoc(ix, "https://nodejs.org/", "node runtime")
+	addDoc(ix, "https://example.com/", "unrelated text")
+
+	if got := s.Suggest("nodejs", 5); !sameStrings(got, []string{"nodejs.org"}) {
+		t.Errorf("Suggest(nodejs, 5) = %v, want nodejs.org", got)
+	}
+}
+
+func TestSuggestKeepsHeaviestMatchesOfWidePrefix(t *testing.T) {
+	s, ix := newSearcher()
+	for i := 0; i < 40; i++ {
+		term := fmt.Sprintf("term%02d", i)
+		ix.AddDocument(fmt.Sprintf("https://a.com/%d", i), "t", term, []string{term})
+	}
+	for i := 0; i < 3; i++ {
+		ix.AddDocument(fmt.Sprintf("https://b.com/%d", i), "t", "", []string{"termzz"})
+	}
+
+	got := s.Suggest("term", 2)
+	if !sameStrings(got, []string{"termzz", "term00"}) {
+		t.Fatalf("Suggest(term, 2) = %v, want the heaviest term then the alphabetically first tie", got)
+	}
+}
+
+func sameStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

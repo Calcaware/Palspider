@@ -18,6 +18,13 @@ type Indexer struct {
 	nextID int
 	index  map[string]map[int]int
 	byURL  map[string]int
+
+	// The tries back the autocomplete lookups: vocabulary terms and host
+	// names are also stored by prefix, so suggesting never walks the whole
+	// vocabulary or every document. hostDocs holds the document IDs per host.
+	terms    prefixTrie
+	hosts    prefixTrie
+	hostDocs map[string]map[int]struct{}
 }
 
 func New() *Indexer {
@@ -42,12 +49,14 @@ func (ix *Indexer) AddDocument(url, title, text string, terms []string) int {
 	if _, ok := ix.byURL[url]; !ok {
 		ix.byURL[url] = id
 	}
+	ix.trackHost(id, url)
 
 	for _, term := range terms {
 		postings, ok := ix.index[term]
 		if !ok {
 			postings = make(map[int]int)
 			ix.index[term] = postings
+			ix.terms.Insert(term)
 		}
 		postings[id]++
 	}
@@ -168,6 +177,7 @@ func (ix *Indexer) RestoreDocument(doc Document) {
 	if _, ok := ix.byURL[doc.URL]; !ok {
 		ix.byURL[doc.URL] = doc.ID
 	}
+	ix.trackHost(doc.ID, doc.URL)
 	if doc.ID >= ix.nextID {
 		ix.nextID = doc.ID + 1
 	}
@@ -176,6 +186,9 @@ func (ix *Indexer) RestoreDocument(doc Document) {
 func (ix *Indexer) RestorePostings(term string, postings map[int]int) {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
+	if _, known := ix.index[term]; !known {
+		ix.terms.Insert(term)
+	}
 	ix.index[term] = postings
 }
 
