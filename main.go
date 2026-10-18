@@ -459,9 +459,11 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// validSeedURL accepts only absolute http(s) URLs.
-func validSeedURL(raw string) bool {
-	return crawler.CheckURLPolicy(raw) == nil
+// seedURLError returns nil when raw can be seeded. When it cannot, the error
+// says why: a malformed URL, a host the policy rejects, or a URL the crawl
+// exclusion rules skip.
+func seedURLError(raw string) error {
+	return crawler.CheckURLPolicy(raw)
 }
 
 // render executes a template, logging failures after headers were written.
@@ -597,7 +599,7 @@ func handleCrawl(e *engine.Engine) http.HandlerFunc {
 			http.Redirect(w, r, "/", http.StatusSeeOther)
 			return
 		}
-		if !validSeedURL(raw) {
+		if seedURLError(raw) != nil {
 			http.Redirect(w, r, "/?crawl=invalid", http.StatusSeeOther)
 			return
 		}
@@ -617,8 +619,8 @@ func handleAPICrawl(e *engine.Engine) http.HandlerFunc {
 			writeJSONError(w, http.StatusBadRequest, "invalid JSON")
 			return
 		}
-		if !validSeedURL(body.URL) {
-			writeJSONError(w, http.StatusBadRequest, "url must be an absolute http or https URL")
+		if err := seedURLError(body.URL); err != nil {
+			writeJSONError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		normalized := crawler.NormalizeURL(strings.TrimSpace(body.URL))

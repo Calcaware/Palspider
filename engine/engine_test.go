@@ -3,11 +3,13 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/calcaware/palspider/crawler"
 	"github.com/calcaware/palspider/searcher"
 )
 
@@ -253,6 +255,52 @@ func TestSitemapEachStreamsAndFiltersByHost(t *testing.T) {
 	sentinel := errors.New("stop")
 	if _, err := e.SitemapEach("", 0, func(string) error { return sentinel }); !errors.Is(err, sentinel) {
 		t.Fatalf("SitemapEach error = %v, want sentinel", err)
+	}
+}
+
+func TestScheduleRetrySkipsExcludedURLs(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/search"
+	e.mu.Lock()
+	e.visited[rawURL] = struct{}{}
+	e.mu.Unlock()
+
+	e.scheduleRetry(rawURL, 0, fmt.Errorf("%w: path %q", crawler.ErrExcluded, "/search"))
+
+	e.mu.Lock()
+	_, retried := e.retryAt[rawURL]
+	e.mu.Unlock()
+	if retried {
+		t.Fatal("excluded URL must not be rescheduled for retry")
+	}
+}
+
+func TestDiscoverSkipsExcludedLinks(t *testing.T) {
+	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/search,/login")
+	t.Setenv("PALSPIDER_MAX_QUERY_PARAMS", "2")
+
+	e := New(1, 10, 0, nil)
+	html := `<a href="/keep">keep</a>` +
+		`<a href="/search?q=golang">search</a>` +
+		`<a href="/searching">searching</a>` +
+		`<a href="/trap?a=1&b=2&c=3">trap</a>`
+	dirty, items := e.discover("https://example.com/", html, 0)
+
+	want := map[string]bool{
+		"https://example.com/keep":      true,
+		"https://example.com/searching": true,
+	}
+	if len(items) != len(want) {
+		t.Fatalf("discover queued %d items %v, want %d", len(items), items, len(want))
+	}
+	for _, item := range items {
+		if !want[item.url] {
+			t.Errorf("discover queued %q, want only crawlable links", item.url)
+		}
+	}
+	// Excluded links still count toward in-degree so link weights stay right.
+	if len(dirty) != 4 {
+		t.Errorf("dirty link counts = %v, want all 4 discovered links", dirty)
 	}
 }
 

@@ -2,7 +2,7 @@
 
 This document is a prioritized plan to address the main risks, correctness gaps, and feature opportunities identified in the current codebase.
 
-Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling plus host allowlists and denylists. The remaining unchecked items, including the crawl exclusions, per-host budgets, and stay-in-scope rules planned for section 1.2, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
+Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling, host allowlists and denylists, and crawl exclusions for noisy paths and oversized query strings. The remaining unchecked items in section 1.2, the per-host budgets and stay-in-scope rules, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
 
 ## 1. High-priority fixes
 
@@ -27,7 +27,8 @@ Goal: make crawl behavior safer and more configurable for production use.
 Tasks:
 - [x] Add allowlist and denylist support for domain patterns and URL prefixes.
 - [x] Add robots.txt checks and explicit policy handling for disallowed paths.
-- [ ] Support crawl exclusions for noisy or irrelevant routes such as `/search`, `/login`, large query-string-heavy URLs, and tracking URLs.
+- [x] Support crawl exclusions for noisy or irrelevant routes such as `/search`, `/login`, large query-string-heavy URLs, and tracking URLs.
+- [ ] Add per-host exclusion rules so one site's noisy routes can be skipped without changing the global list.
 - [ ] Add configuration for max pages per host and max links per page.
 - [ ] Add a “stay in scope” policy for seeds and discovered links.
 - [x] Document default behavior and override behavior in the README and API docs.

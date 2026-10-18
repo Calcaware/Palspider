@@ -451,8 +451,8 @@ func TestCrawlSeed(t *testing.T) {
 		t.Errorf("POST /crawl invalid location = %q, want /?crawl=invalid", loc)
 	}
 	code, _, body = get(t, ts.URL+"/?crawl=invalid")
-	if code != 200 || !strings.Contains(body, "Invalid URL") {
-		t.Errorf("GET /?crawl=invalid = %d, alert present = %v", code, strings.Contains(body, "Invalid URL"))
+	if code != 200 || !strings.Contains(body, "URL rejected") {
+		t.Errorf("GET /?crawl=invalid = %d, alert present = %v", code, strings.Contains(body, "URL rejected"))
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
@@ -522,6 +522,35 @@ func TestAPICrawl(t *testing.T) {
 	}
 	if _, ok := st["queueSize"]; !ok {
 		t.Errorf("GET /api/crawl missing queueSize: %s", body)
+	}
+}
+
+func TestAPICrawlAppliesExclusions(t *testing.T) {
+	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/search,/login")
+	ts, done := newTestServer(t)
+	defer done()
+
+	resp := postJSON(t, ts.URL+"/api/crawl", `{"url":"http://127.0.0.1:9/search?q=golang"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("POST /api/crawl excluded status = %d, want 400", resp.StatusCode)
+	}
+	var rejected map[string]string
+	decodeJSON(t, resp, &rejected)
+	if !strings.Contains(rejected["error"], "excluded") {
+		t.Errorf("excluded crawl error = %q, want the exclusion reason", rejected["error"])
+	}
+
+	// Campaign parameters are dropped before the URL is queued.
+	resp = postJSON(t, ts.URL+"/api/crawl", `{"url":"http://127.0.0.1:9/page?utm_source=news&id=7"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Errorf("POST /api/crawl with tracking params status = %d, want 202", resp.StatusCode)
+	}
+	var accepted map[string]string
+	decodeJSON(t, resp, &accepted)
+	if accepted["url"] != "http://127.0.0.1:9/page?id=7" {
+		t.Errorf("seeded url = %q, want tracking parameters stripped", accepted["url"])
 	}
 }
 

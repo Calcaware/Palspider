@@ -306,7 +306,8 @@ Request body:
 
 The URL must be absolute with an `http` or `https` scheme and a non-empty
 host. It is normalized (scheme and host lowercased, default ports stripped,
-trailing slash removed, fragment dropped) before being queued.
+trailing slash removed, fragment dropped, tracking parameters such as
+`utm_source` and `fbclid` removed) before being queued.
 
 Success (`202 Accepted`):
 
@@ -327,6 +328,15 @@ Seeding also applies the host policy up front: a host outside
 `PALSPIDER_ALLOWLIST` or inside `PALSPIDER_DENYLIST` is rejected with a `400`,
 and paths that `robots.txt` disallows are skipped by the worker and logged
 instead of retried (set `PALSPIDER_ALLOW_ROBOTS=0` to ignore robots rules).
+
+The crawl exclusion rules apply to seeds as well. A URL on a path listed in
+`PALSPIDER_EXCLUDE_PATHS` (defaults to `/search, /login`), with more query
+parameters than `PALSPIDER_MAX_QUERY_PARAMS` (default `8`), or with a query
+string longer than `PALSPIDER_MAX_QUERY_LENGTH` bytes (default `1024`) is
+rejected with a `400`, and the error message names the rule that matched.
+Discovered links that hit the same rules are counted for in-degree and then
+dropped from the queue, so the crawler does not spend requests on them. The
+full list of variables is in the README.
 
 ### `GET /api/suggest` and `GET /suggest`
 

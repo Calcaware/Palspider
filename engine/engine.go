@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/url"
 	"sort"
@@ -733,7 +734,7 @@ func (e *Engine) retryDelay(rawURL string) time.Duration {
 }
 
 func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
-	if err == nil || strings.Contains(err.Error(), "blocked") || strings.Contains(err.Error(), "unsupported scheme") || strings.Contains(err.Error(), "invalid URL") || strings.Contains(err.Error(), "not allowed by policy") || strings.Contains(err.Error(), "robots.txt") {
+	if err == nil || errors.Is(err, crawler.ErrExcluded) || strings.Contains(err.Error(), "blocked") || strings.Contains(err.Error(), "unsupported scheme") || strings.Contains(err.Error(), "invalid URL") || strings.Contains(err.Error(), "not allowed by policy") || strings.Contains(err.Error(), "robots.txt") {
 		return
 	}
 
@@ -840,6 +841,11 @@ func (e *Engine) discover(rawURL, html string, depth int) (map[string]int, []cra
 		dirtyLinks[link] = e.LinkStore.Get(link)
 
 		normalized := crawler.NormalizeURL(link)
+		if err := crawler.CheckCrawlExclusions(normalized); err != nil {
+			// The link is still counted above so in-degree stays accurate,
+			// but noisy routes and query traps never reach the queue.
+			continue
+		}
 		childDepth := depth + 1
 		if e.maxDepth >= 0 && childDepth > e.maxDepth {
 			continue

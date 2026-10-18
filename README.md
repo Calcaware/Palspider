@@ -16,7 +16,9 @@ deduplicated by URL, and peer lists gossip automatically.
 - **Crawling** - 50 concurrent workers (configurable), cross-domain, 200 ms
   per-host rate limit, 10 s fetch timeout, 5 MB page cap, one automatic retry
   on network errors, content fingerprints to skip duplicate pages. Crawl depth
-  and total page count are capped.
+  and total page count are capped. Tracking parameters are stripped from
+  links, and noisy routes such as `/search` and `/login` plus query heavy URLs
+  are excluded by default, with redirect targets held to the same rules.
 - **Safety** - the crawler refuses loopback, link-local, and private addresses
   by default so a malicious seed URL cannot probe your LAN or cloud metadata
   endpoint. Set `PALSPIDER_ALLOW_PRIVATE=1` to crawl local hosts on purpose.
@@ -86,6 +88,9 @@ Everything is configured through environment variables:
 | `PALSPIDER_ALLOW_PRIVATE` | unset | Set to `1` to allow crawling loopback and private-network hosts. |
 | `PALSPIDER_ALLOWLIST` | unset | Optional comma/semicolon-separated host allowlist (for example `example.com, *.example.org`). |
 | `PALSPIDER_DENYLIST` | unset | Optional comma/semicolon-separated host denylist that blocks matching domains even when the host is otherwise reachable. |
+| `PALSPIDER_EXCLUDE_PATHS` | `/search, /login` | Comma/semicolon-separated path prefixes that are never crawled. Matching is case-insensitive and stops at segment boundaries, so `/search` excludes `/search/advanced` but not `/searching`. Set to an empty value to crawl every path. |
+| `PALSPIDER_MAX_QUERY_PARAMS` | `8` | Skip URLs with more query parameters than this, which is how faceted and session-id crawl traps are cut off. `0` or a negative value means unlimited. |
+| `PALSPIDER_MAX_QUERY_LENGTH` | `1024` | Skip URLs whose raw query string is longer than this many bytes. `0` or a negative value means unlimited. |
 | `PALSPIDER_ALLOW_ROBOTS` | `1` | Set to `0` to ignore `robots.txt` rules and crawl disallowed paths anyway. |
 | `PALSPIDER_AUTH` | unset | `user:pass` - require Basic credentials on `POST`/`DELETE` API routes. |
 | `PALSPIDER_PUBLIC_RATE_LIMIT` | unset | Optional per-IP GET request cap within a rolling 60-second window. Example: `60` allows 60 public GETs per minute before returning `429`. |
@@ -130,7 +135,7 @@ Everything is configured through environment variables:
 | Path | Responsibility |
 |---|---|
 | `main.go` | Entrypoint: HTTP routes, HTML and JSON handlers, template parsing, seed data, graceful shutdown. |
-| `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL`, `Tokenize`, `ContentFingerprint`. |
+| `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL` (tracking parameters stripped), `CheckCrawlExclusions` (noisy path prefixes and query caps), `Tokenize`, `ContentFingerprint`. |
 | `engine/` | Worker pool, URL queue with depth tracking, dedupe sets, persistence, local plus distributed search, stats. |
 | `indexer/` | `Indexer` (documents, inverted index, URL lookup, prefix tries for autocomplete) and `LinkStore` (in-degree counts per URL). |
 | `trie/` | Path-segment trie keyed by host: subtree doc IDs (cluster boost) and depth. |
@@ -143,10 +148,13 @@ Everything is configured through environment variables:
 ### Crawl pipeline
 
 1. **Seed** - `POST /crawl` or the built-in seed list normalizes the URL, marks
-   it visited, and pushes it onto the queue at depth 0.
+   it visited, and pushes it onto the queue at depth 0. Seeds are validated
+   first, so a host the policy rejects or a path on the exclusion list is
+   refused with an error instead of being queued.
 2. **Fetch** - a worker pulls the URL, waits on the per-host rate limiter, and
    downloads up to 5 MB of `text/html`. Network errors are retried once;
-   HTTP errors are logged and skipped.
+   HTTP errors are logged and skipped. Excluded URLs are refused before the
+   request is made and are never retried.
 3. **Dedupe** - the page text is fingerprinted (MD5 of the first 500 normalized
    characters); known fingerprints and already-indexed URLs are skipped.
 4. **Index** - text is tokenized (lowercased, `a-z0-9-` plus Unicode letters,
@@ -154,8 +162,9 @@ Everything is configured through environment variables:
    trie, then the document, its postings, and the page's link counts are
    written in one database transaction.
 5. **Discover** - every `<a href>` on the page (script blocks stripped) is
-   resolved, normalized, counted as an in-degree link, and enqueued if it is
-   not already visited or pending and is within the depth and page limits.
+   resolved, normalized (tracking parameters removed), counted as an in-degree
+   link, and enqueued if it is not already visited or pending, not caught by
+   the crawl exclusion rules, and within the depth and page limits.
 6. **Accounting** - when a worker dequeues a URL it moves from pending to
    visited, so the "discovered" counter reflects real crawl progress.
 
@@ -264,10 +273,11 @@ go test ./...       # run the test suite
 go test -race ./... # same, with the race detector (needs CGO / gcc)
 ```
 
-The test suite covers URL normalization, text and link extraction, tokenizing,
-rate limiting, the private-address guard, trie concurrency, index bookkeeping,
-prefix lookups, ranking and suggestions, batch persistence, result merging,
-document export (JSON and streaming NDJSON), and peer URL handling.
+The test suite covers URL normalization, crawl exclusions, text and link
+extraction, tokenizing, rate limiting, the private-address guard, trie
+concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
+persistence, result merging, document export (JSON and streaming NDJSON), and
+peer URL handling.
 
 ## Known issues
 

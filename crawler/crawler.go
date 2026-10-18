@@ -66,6 +66,14 @@ var defaultClient = &http.Client{
 		if len(via) >= 10 {
 			return fmt.Errorf("stopped after 10 redirects")
 		}
+		// Redirect targets are checked like the original request, otherwise a
+		// page could hand the crawler a path or host the policy rejects.
+		if err := CheckCrawlExclusions(req.URL.String()); err != nil {
+			return err
+		}
+		if err := checkHostPolicy(req.URL.String()); err != nil {
+			return err
+		}
 		return checkHostAllowed(req.URL.Host)
 	},
 	Transport: &http.Transport{
@@ -197,9 +205,10 @@ func checkHostPolicy(rawURL string) error {
 	return nil
 }
 
-// CheckURLPolicy validates URL scheme, host safety, and optional allowlist/
-// denylist policy. It is used by web and API URL validators so the crawler and
-// seed input follow the same host policy.
+// CheckURLPolicy validates URL scheme, host safety, optional allowlist and
+// denylist policy, and the crawl exclusion rules for noisy paths and
+// oversized query strings. It is used by web and API URL validators so seed
+// input follows the same policy as the crawler.
 func CheckURLPolicy(rawURL string) error {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || u.Scheme == "" || u.Host == "" {
@@ -208,7 +217,10 @@ func CheckURLPolicy(rawURL string) error {
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return fmt.Errorf("unsupported scheme %q", u.Scheme)
 	}
-	return checkHostPolicy(u.String())
+	if err := checkHostPolicy(u.String()); err != nil {
+		return err
+	}
+	return CheckCrawlExclusions(u.String())
 }
 
 // checkHostAllowed blocks requests to loopback, link-local, and private
@@ -274,6 +286,9 @@ func FetchContext(ctx context.Context, rawURL string, limiter *RateLimiter) (str
 	if err := checkHostPolicy(rawURL); err != nil {
 		return "", err
 	}
+	if err := CheckCrawlExclusions(rawURL); err != nil {
+		return "", err
+	}
 	if !isRobotsAllowed(rawURL) {
 		return "", fmt.Errorf("robots.txt disallows %s", rawURL)
 	}
@@ -283,7 +298,9 @@ func FetchContext(ctx context.Context, rawURL string, limiter *RateLimiter) (str
 	}
 
 	body, err := doFetch(ctx, rawURL)
-	if err != nil && !isServerError(err) && ctx.Err() == nil {
+	// A redirect into an excluded path or a rejected host fails the same way
+	// on every attempt, so it is not worth the second request.
+	if err != nil && !isServerError(err) && !errors.Is(err, ErrExcluded) && ctx.Err() == nil {
 		if limiter != nil {
 			limiter.Wait(u.Host)
 		}
@@ -598,6 +615,11 @@ func NormalizeURL(raw string) string {
 	}
 	u.Path = path
 	u.RawPath = ""
+	// Campaign and click identifiers are dropped so the same page linked with
+	// different tracking parameters normalizes to one crawlable URL.
+	if cleaned, changed := stripTrackingQuery(u.RawQuery); changed {
+		u.RawQuery = cleaned
+	}
 	return u.String()
 }
 
