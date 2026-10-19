@@ -28,6 +28,15 @@ const (
 	defaultMaxQueryLength = 1024
 )
 
+// EnvMaxPagesPerHost and EnvMaxLinksPerPage name the variables that bound the
+// crawl. MaxPagesPerHost caps how many pages one host may contribute to the
+// index; MaxLinksPerPage caps how many links are followed from a single page.
+// Both default to zero, which means unlimited.
+const (
+	EnvMaxPagesPerHost = "PALSPIDER_MAX_PAGES_PER_HOST"
+	EnvMaxLinksPerPage = "PALSPIDER_MAX_LINKS_PER_PAGE"
+)
+
 // excludePaths returns the path prefixes that are never crawled.
 func excludePaths() []string {
 	if value, ok := os.LookupEnv("PALSPIDER_EXCLUDE_PATHS"); ok {
@@ -49,6 +58,26 @@ func crawlLimit(name string, def int) int {
 		return def
 	}
 	return n
+}
+
+// MaxPagesPerHost returns the per-host document budget. Zero means unlimited.
+func MaxPagesPerHost() int {
+	return crawlLimit(EnvMaxPagesPerHost, 0)
+}
+
+// MaxLinksPerPage returns how many links may be followed from one page.
+// Zero means unlimited.
+func MaxLinksPerPage() int {
+	return crawlLimit(EnvMaxLinksPerPage, 0)
+}
+
+// LimitLinks truncates links to the value of PALSPIDER_MAX_LINKS_PER_PAGE.
+// The input order is preserved, so callers that rank links keep their ranking.
+func LimitLinks(links []string) []string {
+	if max := MaxLinksPerPage(); max > 0 && len(links) > max {
+		return links[:max]
+	}
+	return links
 }
 
 // matchesExcludePath reports whether path falls under prefix. Matching is

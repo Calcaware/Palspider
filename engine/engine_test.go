@@ -326,3 +326,48 @@ func TestScheduleRetryDefersFailuresForOneHour(t *testing.T) {
 		t.Fatalf("retryDelay = %v, want a positive delay within 1 hour", delay)
 	}
 }
+
+func TestDiscoverCapsLinksPerPage(t *testing.T) {
+	t.Setenv(crawler.EnvMaxLinksPerPage, "2")
+
+	e := New(1, 10, 0, nil)
+	html := `<a href="/a">a</a><a href="/b">b</a><a href="/c">c</a>`
+	_, items := e.discover("https://example.com/", html, 0)
+
+	if len(items) != 2 {
+		t.Fatalf("discover queued %d items %v, want 2 (the per-page cap)", len(items), items)
+	}
+	// Only the followed links are counted for in-degree; the dropped ones are
+	// never even looked at.
+	if got := e.LinkStore.Get("https://example.com/c"); got != 0 {
+		t.Errorf("dropped link c has link count %d, want 0", got)
+	}
+}
+
+func TestDiscoverEnforcesPerHostBudget(t *testing.T) {
+	t.Setenv(crawler.EnvMaxPagesPerHost, "1")
+
+	e := New(1, 10, 0, nil)
+	// The host is already at its budget.
+	e.mu.Lock()
+	e.hostDocs["example.com"] = 1
+	e.mu.Unlock()
+
+	html := `<a href="/next">next</a><a href="https://other.com/page">other</a>`
+	_, items := e.discover("https://example.com/", html, 0)
+
+	if len(items) != 1 || items[0].url != "https://other.com/page" {
+		t.Fatalf("discover queued %v, want only the link outside the host that is over budget", items)
+	}
+}
+
+func TestHostHasBudgetUnlimitedByDefault(t *testing.T) {
+	t.Setenv(crawler.EnvMaxPagesPerHost, "")
+	e := New(1, 10, 0, nil)
+	e.mu.Lock()
+	e.hostDocs["example.com"] = 10000
+	e.mu.Unlock()
+	if !e.hostHasBudget("example.com") {
+		t.Error("hostHasBudget = false with no configured budget, want true")
+	}
+}

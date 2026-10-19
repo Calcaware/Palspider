@@ -44,6 +44,7 @@ type Engine struct {
 	workers     int
 	maxDepth    int
 	maxPages    int
+	maxPerHost  int
 	urlChan     chan crawlItem
 	visited     map[string]struct{}
 	fpSeen      map[string]struct{}
@@ -51,6 +52,7 @@ type Engine struct {
 	retryCounts map[string]int
 	retryAt     map[string]time.Time
 	hostStats   map[string]HostStat
+	hostDocs    map[string]int
 	paused      bool
 	mu          sync.Mutex
 	wg          sync.WaitGroup
@@ -89,7 +91,9 @@ type CrawlStatus struct {
 }
 
 // New creates an engine. maxDepth < 0 means unlimited crawl depth; maxPages
-// <= 0 means unlimited pages.
+// <= 0 means unlimited pages. The per-host page budget and per-page link cap
+// come from the environment (PALSPIDER_MAX_PAGES_PER_HOST and
+// PALSPIDER_MAX_LINKS_PER_PAGE).
 func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 	ix := indexer.New()
 	tr := trie.New()
@@ -106,6 +110,7 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 		workers:     workerCount,
 		maxDepth:    maxDepth,
 		maxPages:    maxPages,
+		maxPerHost:  crawler.MaxPagesPerHost(),
 		urlChan:     make(chan crawlItem, 100000),
 		visited:     make(map[string]struct{}),
 		fpSeen:      make(map[string]struct{}),
@@ -113,6 +118,7 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 		retryCounts: make(map[string]int),
 		retryAt:     make(map[string]time.Time),
 		hostStats:   make(map[string]HostStat),
+		hostDocs:    make(map[string]int),
 	}
 	return e
 }
@@ -310,6 +316,7 @@ func (e *Engine) AddDocument(rawURL, title, text string) {
 	terms := crawler.Tokenize(text)
 	id := e.Indexer.AddDocument(normalized, title, text, terms)
 	e.Trie.Insert(normalized, id)
+	e.countHostDoc(normalized)
 
 	linkCount := e.LinkStore.Get(normalized)
 	e.Indexer.SetLinkCount(id, linkCount)
@@ -607,12 +614,46 @@ func (e *Engine) HostStats() map[string]HostStat {
 	return out
 }
 
-func (e *Engine) recordHostStats(rawURL string, ok bool, err error) {
-	u, parseErr := url.Parse(rawURL)
-	host := ""
-	if parseErr == nil {
-		host = u.Hostname()
+// countHostDoc records that a page from rawURL's host was added to the index,
+// which is what the per-host page budget counts against.
+func (e *Engine) countHostDoc(rawURL string) {
+	if e.maxPerHost <= 0 {
+		return
 	}
+	host := hostOf(rawURL)
+	if host == "" {
+		return
+	}
+	e.mu.Lock()
+	e.hostDocs[host]++
+	e.mu.Unlock()
+}
+
+// hostHasBudget reports whether host still has room under the per-host page
+// budget. It counts indexed pages only, so a host just over its budget stops
+// queueing new links until pages are indexed or the budget is raised. Zero
+// means unlimited.
+func (e *Engine) hostHasBudget(host string) bool {
+	if e.maxPerHost <= 0 {
+		return true
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.hostDocs[host] < e.maxPerHost
+}
+
+// hostOf returns the hostname of rawURL, or an empty string when it does not
+// parse.
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+func (e *Engine) recordHostStats(rawURL string, ok bool, err error) {
+	host := hostOf(rawURL)
 	if host == "" {
 		return
 	}
@@ -814,6 +855,7 @@ func (e *Engine) processURL(ctx context.Context, item crawlItem) {
 	terms := crawler.Tokenize(text)
 	docID := e.Indexer.AddDocument(rawURL, title, text, terms)
 	e.Trie.Insert(rawURL, docID)
+	e.countHostDoc(rawURL)
 
 	linkCount := e.LinkStore.Get(rawURL)
 	e.Indexer.SetLinkCount(docID, linkCount)
@@ -833,7 +875,7 @@ func (e *Engine) discover(rawURL, html string, depth int) (map[string]int, []cra
 	if err != nil {
 		return nil, nil
 	}
-	links := crawler.ExtractLinks(html, base)
+	links := crawler.LimitLinks(crawler.ExtractLinks(html, base))
 	dirtyLinks := make(map[string]int, len(links))
 	var toEnqueue []crawlItem
 	for _, link := range links {
@@ -851,6 +893,11 @@ func (e *Engine) discover(rawURL, html string, depth int) (map[string]int, []cra
 			continue
 		}
 		if e.maxPages > 0 && e.Indexer.DocCount() >= e.maxPages {
+			continue
+		}
+		// Per-host budgets keep one noisy site from filling the index. Links
+		// that fall outside the budget are still counted for in-degree.
+		if !e.hostHasBudget(hostOf(normalized)) {
 			continue
 		}
 

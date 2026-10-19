@@ -335,8 +335,14 @@ parameters than `PALSPIDER_MAX_QUERY_PARAMS` (default `8`), or with a query
 string longer than `PALSPIDER_MAX_QUERY_LENGTH` bytes (default `1024`) is
 rejected with a `400`, and the error message names the rule that matched.
 Discovered links that hit the same rules are counted for in-degree and then
-dropped from the queue, so the crawler does not spend requests on them. The
-full list of variables is in the README.
+dropped from the queue, so the crawler does not spend requests on them.
+
+Two further budgets shape the frontier without rejecting the seed itself.
+`PALSPIDER_MAX_LINKS_PER_PAGE` (default unset, meaning unlimited) caps how many
+links are followed from a single page, and `PALSPIDER_MAX_PAGES_PER_HOST`
+(default unset, meaning unlimited) caps how many indexed pages one host may
+contribute. Links outside either budget are still counted for in-degree but are
+not queued. The full list of variables is in the README.
 
 ### `GET /api/suggest` and `GET /suggest`
 

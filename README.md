@@ -84,6 +84,8 @@ Everything is configured through environment variables:
 | `PALSPIDER_WORKERS` | `50` | Number of crawler worker goroutines. |
 | `PALSPIDER_MAX_DEPTH` | `10` | Link hops from a seed. `-1` means unlimited. |
 | `PALSPIDER_MAX_PAGES` | `0` | Stop queueing new pages after this many documents. `0` means unlimited. |
+| `PALSPIDER_MAX_PAGES_PER_HOST` | `0` | Cap how many indexed pages one host may contribute. `0` means unlimited. Discovered links outside the budget are still counted for in-degree but not queued. |
+| `PALSPIDER_MAX_LINKS_PER_PAGE` | `0` | Follow at most this many links from a single page, taking the first ones in document order. `0` means unlimited. |
 | `PALSPIDER_DB` | `palspider.db` | Path to the bbolt database file. |
 | `PALSPIDER_ALLOW_PRIVATE` | unset | Set to `1` to allow crawling loopback and private-network hosts. |
 | `PALSPIDER_ALLOWLIST` | unset | Optional comma/semicolon-separated host allowlist (for example `example.com, *.example.org`). |
@@ -164,7 +166,9 @@ Everything is configured through environment variables:
 5. **Discover** - every `<a href>` on the page (script blocks stripped) is
    resolved, normalized (tracking parameters removed), counted as an in-degree
    link, and enqueued if it is not already visited or pending, not caught by
-   the crawl exclusion rules, and within the depth and page limits.
+   the crawl exclusion rules, within the depth and page limits, and within the
+   per-host page budget. At most `PALSPIDER_MAX_LINKS_PER_PAGE` links are
+   followed from a single page.
 6. **Accounting** - when a worker dequeues a URL it moves from pending to
    visited, so the "discovered" counter reflects real crawl progress.
 
@@ -273,11 +277,11 @@ go test ./...       # run the test suite
 go test -race ./... # same, with the race detector (needs CGO / gcc)
 ```
 
-The test suite covers URL normalization, crawl exclusions, text and link
-extraction, tokenizing, rate limiting, the private-address guard, trie
-concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
-persistence, result merging, document export (JSON and streaming NDJSON), and
-peer URL handling.
+The test suite covers URL normalization, crawl exclusions, per-host and per-page
+crawl budgets, text and link extraction, tokenizing, rate limiting, the
+private-address guard, trie concurrency, index bookkeeping, prefix lookups,
+ranking and suggestions, batch persistence, result merging, document export
+(JSON and streaming NDJSON), and peer URL handling.
 
 ## Known issues
 
@@ -288,8 +292,9 @@ Things that are still wrong or missing after the current round of fixes:
    files, and there is no per-host politeness delay beyond the fixed 200 ms
    limiter.
 2. **Everything lives in RAM.** All documents and postings are held in memory,
-   so a big crawl grows without bound. `PALSPIDER_MAX_PAGES` is the only
-   brake.
+   so a big crawl grows without bound. `PALSPIDER_MAX_PAGES`,
+   `PALSPIDER_MAX_PAGES_PER_HOST`, and `PALSPIDER_MAX_DEPTH` are the only
+   brakes, and they bound counts rather than memory use.
 3. **Postings are rewritten in full.** Each new document rewrites the entire
    postings list for every one of its terms. Writes are batched into one
    transaction per page now, but the payload still grows with the corpus.

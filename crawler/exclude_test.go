@@ -148,6 +148,54 @@ func TestCheckCrawlExclusionsIgnoresMalformedURLs(t *testing.T) {
 	}
 }
 
+func TestCrawlBudgetEnv(t *testing.T) {
+	t.Setenv(EnvMaxPagesPerHost, "")
+	if got := MaxPagesPerHost(); got != 0 {
+		t.Errorf("MaxPagesPerHost with an empty value = %d, want 0 (unlimited)", got)
+	}
+	t.Setenv(EnvMaxPagesPerHost, "25")
+	if got := MaxPagesPerHost(); got != 25 {
+		t.Errorf("MaxPagesPerHost = %d, want 25", got)
+	}
+	t.Setenv(EnvMaxPagesPerHost, "nonsense")
+	if got := MaxPagesPerHost(); got != 0 {
+		t.Errorf("MaxPagesPerHost with a bad value = %d, want the default 0", got)
+	}
+
+	t.Setenv(EnvMaxLinksPerPage, "")
+	if got := MaxLinksPerPage(); got != 0 {
+		t.Errorf("MaxLinksPerPage by default = %d, want 0 (unlimited)", got)
+	}
+	t.Setenv(EnvMaxLinksPerPage, "3")
+	if got := MaxLinksPerPage(); got != 3 {
+		t.Errorf("MaxLinksPerPage = %d, want 3", got)
+	}
+	t.Setenv(EnvMaxLinksPerPage, "-2")
+	if got := MaxLinksPerPage(); got != -2 {
+		t.Errorf("MaxLinksPerPage = %d, want the parsed negative value", got)
+	}
+}
+
+func TestLimitLinks(t *testing.T) {
+	links := []string{"a", "b", "c", "d", "e"}
+
+	t.Setenv(EnvMaxLinksPerPage, "")
+	if got := LimitLinks(links); len(got) != len(links) {
+		t.Errorf("LimitLinks with no cap = %v, want all %d links", got, len(links))
+	}
+
+	t.Setenv(EnvMaxLinksPerPage, "3")
+	got := LimitLinks(links)
+	if len(got) != 3 || got[2] != "c" {
+		t.Errorf("LimitLinks with a cap of 3 = %v, want the first 3 links in order", got)
+	}
+
+	t.Setenv(EnvMaxLinksPerPage, "10")
+	if got := LimitLinks(links); len(got) != len(links) {
+		t.Errorf("LimitLinks with a cap over the length = %v, want every link", got)
+	}
+}
+
 func TestNormalizeURLStripsTrackingParams(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"https://example.com/p?utm_source=news&utm_medium=email", "https://example.com/p"},
