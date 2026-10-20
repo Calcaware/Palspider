@@ -14,7 +14,7 @@ import (
 // built-in defaults even when the shell exports them.
 func clearExclusionEnv(t *testing.T) {
 	t.Helper()
-	for _, name := range []string{"PALSPIDER_EXCLUDE_PATHS", "PALSPIDER_MAX_QUERY_PARAMS", "PALSPIDER_MAX_QUERY_LENGTH"} {
+	for _, name := range []string{"PALSPIDER_EXCLUDE_PATHS", "PALSPIDER_HOST_EXCLUDE_PATHS", "PALSPIDER_MAX_QUERY_PARAMS", "PALSPIDER_MAX_QUERY_LENGTH"} {
 		old, wasSet := os.LookupEnv(name)
 		if err := os.Unsetenv(name); err != nil {
 			t.Fatalf("unset %s: %v", name, err)
@@ -73,6 +73,64 @@ func TestCheckCrawlExclusionsPathOverride(t *testing.T) {
 	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "")
 	if err := CheckCrawlExclusions("https://example.com/login"); err != nil {
 		t.Errorf("empty PALSPIDER_EXCLUDE_PATHS should allow /login, got %v", err)
+	}
+}
+
+func TestCheckCrawlExclusionsPerHostPaths(t *testing.T) {
+	clearExclusionEnv(t)
+	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/global")
+	t.Setenv(EnvHostExcludePaths, "example.com:/search, /login; forum.example.org:/thread")
+
+	cases := []struct {
+		raw      string
+		excluded bool
+	}{
+		{"https://example.com/search", true},
+		{"https://www.example.com/search/advanced", true},
+		{"https://example.com/login/oauth", true},
+		{"https://example.com/global", true},
+		{"https://example.com/posts", false},
+		{"https://forum.example.org/thread/42", true},
+		{"https://forum.example.org/posts", false},
+		{"https://blog.example.org/thread/42", false},
+		{"https://notexample.com/search", false},
+		{"https://other.org/search", false},
+		{"https://other.org/global", true},
+	}
+	for _, c := range cases {
+		err := CheckCrawlExclusions(c.raw)
+		if c.excluded && !errors.Is(err, ErrExcluded) {
+			t.Errorf("CheckCrawlExclusions(%q) = %v, want ErrExcluded", c.raw, err)
+		}
+		if !c.excluded && err != nil {
+			t.Errorf("CheckCrawlExclusions(%q) = %v, want nil", c.raw, err)
+		}
+	}
+
+	if err := CheckURLPolicy("https://example.com/search"); !errors.Is(err, ErrExcluded) {
+		t.Errorf("CheckURLPolicy on a path excluded for its host = %v, want ErrExcluded", err)
+	}
+}
+
+func TestHostExcludeRulesDropMalformedEntries(t *testing.T) {
+	clearExclusionEnv(t)
+	t.Setenv(EnvHostExcludePaths, "no colon here; :/orphan; example.com:; example.com:/admin, /wp-admin")
+
+	rules := hostExcludeRules()
+	if len(rules) != 1 {
+		t.Fatalf("hostExcludeRules() = %v, want one usable rule", rules)
+	}
+	if rules[0].host != "example.com" || len(rules[0].paths) != 2 {
+		t.Errorf("hostExcludeRules() = %v, want example.com with two paths", rules)
+	}
+
+	t.Setenv(EnvHostExcludePaths, "")
+	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "")
+	if rules := hostExcludeRules(); len(rules) != 0 {
+		t.Errorf("hostExcludeRules() with an empty value = %v, want none", rules)
+	}
+	if err := CheckCrawlExclusions("https://example.com/search"); err != nil {
+		t.Errorf("with host rules and the global list both empty, /search = %v, want nil", err)
 	}
 }
 

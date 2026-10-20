@@ -328,6 +328,9 @@ Seeding also applies the host policy up front: a host outside
 `PALSPIDER_ALLOWLIST` or inside `PALSPIDER_DENYLIST` is rejected with a `400`,
 and paths that `robots.txt` disallows are skipped by the worker and logged
 instead of retried (set `PALSPIDER_ALLOW_ROBOTS=0` to ignore robots rules).
+When an `Allow` and a `Disallow` rule both match a path, the longer and
+therefore more specific rule wins, with `Allow` winning a tie, so a site can
+disallow a whole directory while still opening one page inside it.
 
 The crawl exclusion rules apply to seeds as well. A URL on a path listed in
 `PALSPIDER_EXCLUDE_PATHS` (defaults to `/search, /login`), with more query
@@ -336,6 +339,13 @@ string longer than `PALSPIDER_MAX_QUERY_LENGTH` bytes (default `1024`) is
 rejected with a `400`, and the error message names the rule that matched.
 Discovered links that hit the same rules are counted for in-degree and then
 dropped from the queue, so the crawler does not spend requests on them.
+
+`PALSPIDER_HOST_EXCLUDE_PATHS` narrows the same path rules to individual
+sites instead of changing the global list. Entries are `host pattern:path, path`
+groups separated by semicolons, for example
+`example.com:/search, /login; forum.example.org:/thread`. A pattern matches the
+host and its subdomains the same way `PALSPIDER_ALLOWLIST` patterns do, and a
+matching seed is rejected with a `400` just like a global exclusion.
 
 Two further budgets shape the frontier without rejecting the seed itself.
 `PALSPIDER_MAX_LINKS_PER_PAGE` (default unset, meaning unlimited) caps how many

@@ -91,6 +91,7 @@ Everything is configured through environment variables:
 | `PALSPIDER_ALLOWLIST` | unset | Optional comma/semicolon-separated host allowlist (for example `example.com, *.example.org`). |
 | `PALSPIDER_DENYLIST` | unset | Optional comma/semicolon-separated host denylist that blocks matching domains even when the host is otherwise reachable. |
 | `PALSPIDER_EXCLUDE_PATHS` | `/search, /login` | Comma/semicolon-separated path prefixes that are never crawled. Matching is case-insensitive and stops at segment boundaries, so `/search` excludes `/search/advanced` but not `/searching`. Set to an empty value to crawl every path. |
+| `PALSPIDER_HOST_EXCLUDE_PATHS` | unset | Route exclusions for a single site, written as `host pattern:path, path` entries separated by semicolons, for example `example.com:/search, /login; forum.example.org:/thread`. Patterns work like the allowlist, so `example.com` also covers `www.example.com`, and a `*` matches every host. The global list above still applies everywhere. |
 | `PALSPIDER_MAX_QUERY_PARAMS` | `8` | Skip URLs with more query parameters than this, which is how faceted and session-id crawl traps are cut off. `0` or a negative value means unlimited. |
 | `PALSPIDER_MAX_QUERY_LENGTH` | `1024` | Skip URLs whose raw query string is longer than this many bytes. `0` or a negative value means unlimited. |
 | `PALSPIDER_ALLOW_ROBOTS` | `1` | Set to `0` to ignore `robots.txt` rules and crawl disallowed paths anyway. |
@@ -137,7 +138,7 @@ Everything is configured through environment variables:
 | Path | Responsibility |
 |---|---|
 | `main.go` | Entrypoint: HTTP routes, HTML and JSON handlers, template parsing, seed data, graceful shutdown. |
-| `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL` (tracking parameters stripped), `CheckCrawlExclusions` (noisy path prefixes and query caps), `Tokenize`, `ContentFingerprint`. |
+| `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL` (tracking parameters stripped), `CheckCrawlExclusions` (global and per-host path prefixes, query caps), `Tokenize`, `ContentFingerprint`. |
 | `engine/` | Worker pool, URL queue with depth tracking, dedupe sets, persistence, local plus distributed search, stats. |
 | `indexer/` | `Indexer` (documents, inverted index, URL lookup, prefix tries for autocomplete) and `LinkStore` (in-degree counts per URL). |
 | `trie/` | Path-segment trie keyed by host: subtree doc IDs (cluster boost) and depth. |
@@ -277,11 +278,12 @@ go test ./...       # run the test suite
 go test -race ./... # same, with the race detector (needs CGO / gcc)
 ```
 
-The test suite covers URL normalization, crawl exclusions, per-host and per-page
-crawl budgets, text and link extraction, tokenizing, rate limiting, the
-private-address guard, trie concurrency, index bookkeeping, prefix lookups,
-ranking and suggestions, batch persistence, result merging, document export
-(JSON and streaming NDJSON), and peer URL handling.
+The test suite covers URL normalization, crawl exclusions (global and per host),
+robots rule precedence, per-host and per-page crawl budgets, text and link
+extraction, tokenizing, rate limiting, the private-address guard, trie
+concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
+persistence, result merging, document export (JSON and streaming NDJSON), and
+peer URL handling.
 
 ## Known issues
 

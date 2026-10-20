@@ -2,7 +2,7 @@
 
 This document is a prioritized plan to address the main risks, correctness gaps, and feature opportunities identified in the current codebase.
 
-Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling, host allowlists and denylists, crawl exclusions for noisy paths and oversized query strings, and per-host and per-page crawl budgets. The remaining unchecked items in section 1.2, the per-host route exclusions and the stay-in-scope rules, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
+Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling, host allowlists and denylists, crawl exclusions for noisy paths (globally and per host) and oversized query strings, and per-host and per-page crawl budgets. The remaining unchecked items in section 1.2, the stay-in-scope rule, persisted per-host page counts, and crawl-delay support, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
 
 ## 1. High-priority fixes
 
@@ -28,10 +28,11 @@ Tasks:
 - [x] Add allowlist and denylist support for domain patterns and URL prefixes.
 - [x] Add robots.txt checks and explicit policy handling for disallowed paths.
 - [x] Support crawl exclusions for noisy or irrelevant routes such as `/search`, `/login`, large query-string-heavy URLs, and tracking URLs.
-- [ ] Add per-host exclusion rules so one site's noisy routes can be skipped without changing the global list.
+- [x] Add per-host exclusion rules so one site's noisy routes can be skipped without changing the global list.
 - [x] Add configuration for max pages per host and max links per page.
 - [ ] Add a “stay in scope” policy for seeds and discovered links.
 - [ ] Persist per-host page counts so the per-host budget survives a restart instead of resetting to zero.
+- [ ] Honor a site's `Crawl-delay` from robots.txt in the per-host rate limiter when it asks for a longer wait than the configured 200 ms.
 - [x] Document default behavior and override behavior in the README and API docs.
 
 Why:

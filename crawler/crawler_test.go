@@ -264,6 +264,35 @@ func TestRobotsPolicyDisallowsBlockedPaths(t *testing.T) {
 	}
 }
 
+func TestRobotsRulePrecedence(t *testing.T) {
+	cases := []struct {
+		name   string
+		policy *robotsPolicy
+		path   string
+		want   bool
+	}{
+		{"no policy allows the path", nil, "/anything", true},
+		{"empty disallow allows the path", &robotsPolicy{deny: []string{""}}, "/", true},
+		{"unmatched path is allowed", &robotsPolicy{deny: []string{"/private"}}, "/public", true},
+		{"disallow covers the prefix", &robotsPolicy{deny: []string{"/private"}}, "/private/secret", false},
+		{"longer allow beats a broader disallow", &robotsPolicy{deny: []string{"/private"}, allow: []string{"/private/public"}}, "/private/public", true},
+		{"allow only covers its own prefix", &robotsPolicy{deny: []string{"/private"}, allow: []string{"/private/public"}}, "/private/other", false},
+		{"longer disallow beats a shorter allow", &robotsPolicy{deny: []string{"/private/public"}, allow: []string{"/private"}}, "/private/public", false},
+		{"equal rules favor allow", &robotsPolicy{deny: []string{"/page"}, allow: []string{"/page"}}, "/page", true},
+		{"disallow root blocks every path", &robotsPolicy{deny: []string{"/"}}, "/deep/page", false},
+		{"disallow root still allows a longer allow", &robotsPolicy{deny: []string{"/"}, allow: []string{"/public"}}, "/public/page", true},
+		{"wildcard disallow matches its prefix", &robotsPolicy{deny: []string{"/news*"}}, "/news/2026", false},
+		{"wildcard disallow spares other paths", &robotsPolicy{deny: []string{"/news*"}}, "/blog", true},
+		{"longer allow beats a wildcard disallow", &robotsPolicy{deny: []string{"/*"}, allow: []string{"/public"}}, "/public", true},
+		{"wildcard disallow covers everything else", &robotsPolicy{deny: []string{"/*"}}, "/public", false},
+	}
+	for _, c := range cases {
+		if got := robotsAllows(c.policy, c.path); got != c.want {
+			t.Errorf("%s: robotsAllows(%v, %q) = %v, want %v", c.name, c.policy, c.path, got, c.want)
+		}
+	}
+}
+
 func TestFetchAllowsPrivateWhenConfigured(t *testing.T) {
 	t.Setenv("PALSPIDER_ALLOW_PRIVATE", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

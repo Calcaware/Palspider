@@ -110,6 +110,7 @@ func robotsPolicyForHost(host string) (*robotsPolicy, error) {
 	return policy, nil
 }
 
+// isRobotsAllowed reports whether robots.txt lets the crawler fetch rawURL.
 func isRobotsAllowed(rawURL string) bool {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
@@ -123,30 +124,48 @@ func isRobotsAllowed(rawURL string) bool {
 	if path == "" {
 		path = "/"
 	}
+	return robotsAllows(policy, path)
+}
+
+// robotsAllows resolves overlapping rules the way the robots exclusion
+// protocol requires: the rule matching the longest prefix of the path wins,
+// and an Allow rule wins when it is at least as long as the Disallow rule it
+// collides with. A path no rule matches is allowed, and "Disallow: /" matches
+// every path instead of only the bare root.
+func robotsAllows(policy *robotsPolicy, path string) bool {
+	if policy == nil {
+		return true
+	}
+	denyLen, allowLen := -1, -1
 	for _, deny := range policy.deny {
-		if matchesPathRule(path, deny) {
-			return false
+		if n := matchedRuleLen(path, deny); n > denyLen {
+			denyLen = n
 		}
 	}
 	for _, allow := range policy.allow {
-		if matchesPathRule(path, allow) {
-			return true
+		if n := matchedRuleLen(path, allow); n > allowLen {
+			allowLen = n
 		}
 	}
-	return true
+	if allowLen >= 0 && allowLen >= denyLen {
+		return true
+	}
+	return denyLen < 0
 }
 
-func matchesPathRule(path, rule string) bool {
+// matchedRuleLen returns the length of the rule prefix that applies to path,
+// or -1 when the rule does not match at all. Rules are prefix patterns with an
+// optional trailing "*", so a longer matching rule is the more specific one.
+func matchedRuleLen(path, rule string) int {
 	rule = strings.TrimSpace(rule)
 	if rule == "" {
-		return false
-	}
-	if rule == "/" {
-		return path == "/"
+		return -1
 	}
 	if strings.HasSuffix(rule, "*") {
 		rule = strings.TrimSuffix(rule, "*")
-		return strings.HasPrefix(path, rule)
 	}
-	return path == rule || strings.HasPrefix(path, rule)
+	if !strings.HasPrefix(path, rule) {
+		return -1
+	}
+	return len(rule)
 }

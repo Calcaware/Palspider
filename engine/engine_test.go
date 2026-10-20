@@ -304,6 +304,33 @@ func TestDiscoverSkipsExcludedLinks(t *testing.T) {
 	}
 }
 
+func TestDiscoverSkipsPerHostExcludedLinks(t *testing.T) {
+	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/global")
+	t.Setenv("PALSPIDER_HOST_EXCLUDE_PATHS", "example.com:/search")
+
+	e := New(1, 10, 0, nil)
+	html := `<a href="/keep">keep</a>` +
+		`<a href="https://example.com/search?q=golang">own search</a>` +
+		`<a href="https://other.org/search">other search</a>`
+	dirty, items := e.discover("https://example.com/", html, 0)
+
+	want := map[string]bool{
+		"https://example.com/keep": true,
+		"https://other.org/search": true,
+	}
+	if len(items) != len(want) {
+		t.Fatalf("discover queued %d items %v, want %d", len(items), items, len(want))
+	}
+	for _, item := range items {
+		if !want[item.url] {
+			t.Errorf("discover queued %q, want only links outside the host rules", item.url)
+		}
+	}
+	if len(dirty) != 3 {
+		t.Errorf("dirty link counts = %v, want all 3 discovered links", dirty)
+	}
+}
+
 func TestScheduleRetryDefersFailuresForOneHour(t *testing.T) {
 	e := New(1, 10, 0, nil)
 	url := "https://example.com/retry"

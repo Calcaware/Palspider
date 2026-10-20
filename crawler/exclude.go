@@ -37,6 +37,47 @@ const (
 	EnvMaxLinksPerPage = "PALSPIDER_MAX_LINKS_PER_PAGE"
 )
 
+// EnvHostExcludePaths names the variable holding route exclusions that apply
+// to a single host instead of to every crawl target.
+const EnvHostExcludePaths = "PALSPIDER_HOST_EXCLUDE_PATHS"
+
+// hostExcludeRule is one entry of PALSPIDER_HOST_EXCLUDE_PATHS: a host
+// pattern and the path prefixes that are never crawled for that host.
+type hostExcludeRule struct {
+	host  string
+	paths []string
+}
+
+// hostExcludeRules parses PALSPIDER_HOST_EXCLUDE_PATHS. Entries are separated
+// by semicolons or newlines and read as "host pattern:path, path", so
+// `example.com:/search, /login; forum.example.org:/thread` skips /search and
+// /login on example.com and its subdomains and /thread on forum.example.org.
+// The first colon splits the pattern from the path list, so patterns are
+// hostnames like the allowlist ones and never carry a port. Entries without a
+// colon or without any path are dropped so one typo does not discard the rest.
+func hostExcludeRules() []hostExcludeRule {
+	value, ok := os.LookupEnv(EnvHostExcludePaths)
+	if !ok {
+		return nil
+	}
+	var rules []hostExcludeRule
+	for _, entry := range strings.FieldsFunc(value, func(r rune) bool {
+		return r == ';' || r == '\n' || r == '\r'
+	}) {
+		host, rawPaths, found := strings.Cut(entry, ":")
+		if !found {
+			continue
+		}
+		host = strings.ToLower(strings.TrimSpace(host))
+		paths := splitCSV(rawPaths)
+		if host == "" || len(paths) == 0 {
+			continue
+		}
+		rules = append(rules, hostExcludeRule{host: host, paths: paths})
+	}
+	return rules
+}
+
 // excludePaths returns the path prefixes that are never crawled.
 func excludePaths() []string {
 	if value, ok := os.LookupEnv("PALSPIDER_EXCLUDE_PATHS"); ok {
@@ -109,8 +150,9 @@ func queryParamCount(rawQuery string) int {
 }
 
 // CheckCrawlExclusions reports whether a URL falls under the crawl exclusion
-// rules: a configured path prefix, more query parameters than allowed, or a
-// query string longer than allowed. The returned error wraps ErrExcluded.
+// rules: a configured path prefix, a path prefix excluded for its host, more
+// query parameters than allowed, or a query string longer than allowed. The
+// returned error wraps ErrExcluded and names the rule that matched.
 // Malformed URLs return nil so the scheme and host checks can report them.
 func CheckCrawlExclusions(rawURL string) error {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
@@ -124,6 +166,16 @@ func CheckCrawlExclusions(rawURL string) error {
 	for _, prefix := range excludePaths() {
 		if matchesExcludePath(path, prefix) {
 			return fmt.Errorf("%w: path %q matches %q", ErrExcluded, path, prefix)
+		}
+	}
+	for _, rule := range hostExcludeRules() {
+		if !matchesHostPattern(u.Hostname(), rule.host) {
+			continue
+		}
+		for _, prefix := range rule.paths {
+			if matchesExcludePath(path, prefix) {
+				return fmt.Errorf("%w: path %q matches %q for host %q", ErrExcluded, path, prefix, rule.host)
+			}
 		}
 	}
 	if max := crawlLimit("PALSPIDER_MAX_QUERY_PARAMS", defaultMaxQueryParams); max > 0 {
