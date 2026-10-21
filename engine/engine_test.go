@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -351,6 +354,125 @@ func TestScheduleRetryDefersFailuresForOneHour(t *testing.T) {
 	}
 	if delay := e.retryDelay(url); delay <= 0 || delay > time.Hour {
 		t.Fatalf("retryDelay = %v, want a positive delay within 1 hour", delay)
+	}
+}
+
+func TestScheduleRetryQueuesTheFailedURLAgain(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	url := "https://example.com/retry"
+
+	e.scheduleRetry(url, 0, errors.New("temporary network failure"))
+
+	if len(e.urlChan) != 1 {
+		t.Fatalf("queue = %d items, want the failed URL to be queued again", len(e.urlChan))
+	}
+	item := <-e.urlChan
+	if item.url != url {
+		t.Errorf("queued item = %q, want %q", item.url, url)
+	}
+	e.mu.Lock()
+	_, pending := e.pending[url]
+	e.mu.Unlock()
+	if !pending {
+		t.Error("the retried URL is not marked pending, so a second copy could be queued")
+	}
+}
+
+func TestScheduleRetryStopsWhenTheBudgetIsSpent(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	url := "https://example.com/dead"
+
+	for i := 0; i < maxRetries; i++ {
+		e.scheduleRetry(url, 0, errors.New("temporary network failure"))
+	}
+	if len(e.urlChan) != maxRetries {
+		t.Fatalf("queue = %d items, want one per attempt", len(e.urlChan))
+	}
+
+	e.scheduleRetry(url, 0, errors.New("temporary network failure"))
+	if len(e.urlChan) != maxRetries {
+		t.Errorf("queue = %d items after the budget was spent, want %d", len(e.urlChan), maxRetries)
+	}
+	e.mu.Lock()
+	_, visited := e.visited[url]
+	e.mu.Unlock()
+	if !visited {
+		t.Error("a URL that ran out of retries is not marked visited, so it would be crawled again")
+	}
+}
+
+func TestScheduleRetryIgnoresPermanentFailures(t *testing.T) {
+	t.Setenv("PALSPIDER_ALLOW_PRIVATE", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	missing := srv.URL + "/missing"
+	_, err := crawler.FetchContext(context.Background(), missing, nil)
+	if err == nil {
+		t.Fatal("fetching a missing page returned no error")
+	}
+	if !crawler.IsPermanent(err) {
+		t.Fatalf("error for a missing page = %v, want a permanent failure", err)
+	}
+
+	e := New(1, 10, 0, nil)
+	e.scheduleRetry(missing, 0, err)
+
+	if len(e.urlChan) != 0 {
+		t.Errorf("queue = %d items, want a missing page to be dropped instead of retried", len(e.urlChan))
+	}
+	e.mu.Lock()
+	_, retried := e.retryAt[missing]
+	e.mu.Unlock()
+	if retried {
+		t.Error("a permanent failure was scheduled for a retry")
+	}
+}
+
+func TestCrawlerRetriesAPageThatFailed(t *testing.T) {
+	t.Setenv("PALSPIDER_ALLOW_PRIVATE", "1")
+	t.Setenv(EnvRetryDelay, "1")
+
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			w.Header().Set("Content-Type", "text/plain")
+			io.WriteString(w, "User-agent: *\nDisallow:\n")
+			return
+		}
+		if atomic.AddInt32(&hits, 1) == 1 {
+			// The first request fails, the retry succeeds.
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, "<html><title>Retried</title><body>page that needed a retry</body></html>")
+	}))
+	defer srv.Close()
+
+	e := New(1, 3, 0, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.Start(ctx)
+	defer e.Stop()
+	e.Seed(srv.URL + "/page")
+
+	deadline := time.Now().Add(15 * time.Second)
+	for e.Indexer.DocCount() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the page was not indexed after the retry (%d requests)", atomic.LoadInt32(&hits))
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	results := e.Search("retry", 5)
+	if len(results) != 1 {
+		t.Fatalf("search returned %d results, want the retried page", len(results))
+	}
+	if results[0].URL != srv.URL+"/page" {
+		t.Errorf("indexed url = %q, want %q", results[0].URL, srv.URL+"/page")
 	}
 }
 

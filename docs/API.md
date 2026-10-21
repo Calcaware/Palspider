@@ -332,6 +332,19 @@ When an `Allow` and a `Disallow` rule both match a path, the longer and
 therefore more specific rule wins, with `Allow` winning a tie, so a site can
 disallow a whole directory while still opening one page inside it.
 
+A `Crawl-delay` in the same file is honored as well. When a site asks for a
+longer pause than the built in 200 ms per-host limiter, the crawler waits
+that long between two requests to the same host. Fractional seconds are
+accepted, and the wait is capped at five minutes so one site cannot stall a
+crawl.
+
+A page that fails with a transient error, such as a network fault, a timeout,
+a `5xx`, a `408`, or a `429`, is queued again and fetched once more after
+`PALSPIDER_RETRY_DELAY` seconds (default `3600`). The wait doubles with every
+attempt and the crawler gives up after three attempts. Failures that would
+look the same on a second attempt, such as a refused host, an excluded path,
+or a `404`, are dropped right away.
+
 The crawl exclusion rules apply to seeds as well. A URL on a path listed in
 `PALSPIDER_EXCLUDE_PATHS` (defaults to `/search, /login`), with more query
 parameters than `PALSPIDER_MAX_QUERY_PARAMS` (default `8`), or with a query

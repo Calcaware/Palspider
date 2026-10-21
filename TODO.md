@@ -2,7 +2,7 @@
 
 This document is a prioritized plan to address the main risks, correctness gaps, and feature opportunities identified in the current codebase.
 
-Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling, host allowlists and denylists, crawl exclusions for noisy paths (globally and per host) and oversized query strings, and per-host and per-page crawl budgets. The remaining unchecked items in section 1.2, the stay-in-scope rule, persisted per-host page counts, and crawl-delay support, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
+Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling, host allowlists and denylists, crawl exclusions for noisy paths (globally and per host) and oversized query strings, per-host and per-page crawl budgets, and the `Crawl-delay` a site asks for in its robots.txt. The remaining unchecked items in section 1.2, the stay-in-scope rule and persisted per-host page counts, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
 
 ## 1. High-priority fixes
 
@@ -16,6 +16,8 @@ Tasks:
 - [x] Requeue transient failures through a lightweight retry window so failed pages can be revisited without losing crawl progress.
 - [x] Limit retries to a bounded retry window instead of leaving failed pages permanently blacklisted.
 - [x] Add tests covering temporary retries and queue re-entry behavior.
+- [ ] Add jitter to the retry backoff so a group of workers does not hit a recovered host all at once.
+- [ ] Add a per-host retry budget so one unreachable site cannot keep the frontier busy.
 
 Why:
 - Right now, the crawler marks a URL as visited when it is dequeued, even before the fetch succeeds. That makes the system efficient, but it reduces recoverability when a page fails for temporary reasons.
@@ -32,7 +34,7 @@ Tasks:
 - [x] Add configuration for max pages per host and max links per page.
 - [ ] Add a “stay in scope” policy for seeds and discovered links.
 - [ ] Persist per-host page counts so the per-host budget survives a restart instead of resetting to zero.
-- [ ] Honor a site's `Crawl-delay` from robots.txt in the per-host rate limiter when it asks for a longer wait than the configured 200 ms.
+- [x] Honor a site's `Crawl-delay` from robots.txt in the per-host rate limiter when it asks for a longer wait than the configured 200 ms.
 - [x] Document default behavior and override behavior in the README and API docs.
 
 Why:

@@ -14,11 +14,19 @@ deduplicated by URL, and peer lists gossip automatically.
 ## Features
 
 - **Crawling** - 50 concurrent workers (configurable), cross-domain, 200 ms
-  per-host rate limit, 10 s fetch timeout, 5 MB page cap, one automatic retry
-  on network errors, content fingerprints to skip duplicate pages. Crawl depth
-  and total page count are capped. Tracking parameters are stripped from
-  links, and noisy routes such as `/search` and `/login` plus query heavy URLs
-  are excluded by default, with redirect targets held to the same rules.
+  per-host rate limit, 10 s fetch timeout, 5 MB page cap, content fingerprints
+  to skip duplicate pages. Crawl depth and total page count are capped.
+  Tracking parameters are stripped from links, and noisy routes such as
+  `/search` and `/login` plus query heavy URLs are excluded by default, with
+  redirect targets held to the same rules.
+- **Polite crawling** - `robots.txt` rules are honored, including a site's
+  `Crawl-delay`, which slows the per-host rate limiter down when the site
+  asks for a longer wait than the configured 200 ms.
+- **Retries** - a page that fails with a transient error (network fault,
+  timeout, `5xx`, `408`, or `429`) is put back on the queue and fetched again
+  after a growing wait, up to three attempts in total. Failures that would
+  look the same on a second attempt (a refused host, an excluded path, a
+  `4xx`) are dropped at once.
 - **Safety** - the crawler refuses loopback, link-local, and private addresses
   by default so a malicious seed URL cannot probe your LAN or cloud metadata
   endpoint. Set `PALSPIDER_ALLOW_PRIVATE=1` to crawl local hosts on purpose.
@@ -95,6 +103,7 @@ Everything is configured through environment variables:
 | `PALSPIDER_MAX_QUERY_PARAMS` | `8` | Skip URLs with more query parameters than this, which is how faceted and session-id crawl traps are cut off. `0` or a negative value means unlimited. |
 | `PALSPIDER_MAX_QUERY_LENGTH` | `1024` | Skip URLs whose raw query string is longer than this many bytes. `0` or a negative value means unlimited. |
 | `PALSPIDER_ALLOW_ROBOTS` | `1` | Set to `0` to ignore `robots.txt` rules and crawl disallowed paths anyway. |
+| `PALSPIDER_RETRY_DELAY` | `3600` | Seconds to wait before a page that failed with a transient error is fetched again. The wait doubles with every attempt, and the crawler gives up after three attempts. |
 | `PALSPIDER_AUTH` | unset | `user:pass` - require Basic credentials on `POST`/`DELETE` API routes. |
 | `PALSPIDER_PUBLIC_RATE_LIMIT` | unset | Optional per-IP GET request cap within a rolling 60-second window. Example: `60` allows 60 public GETs per minute before returning `429`. |
 | `PALSPIDER_PEER_TOKEN` | unset | Optional bearer token used for peer mesh search and gossip traffic. |
@@ -138,7 +147,7 @@ Everything is configured through environment variables:
 | Path | Responsibility |
 |---|---|
 | `main.go` | Entrypoint: HTTP routes, HTML and JSON handlers, template parsing, seed data, graceful shutdown. |
-| `crawler/` | `Fetch` (per-host rate limiter, private-address guard, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL` (tracking parameters stripped), `CheckCrawlExclusions` (global and per-host path prefixes, query caps), `Tokenize`, `ContentFingerprint`. |
+| `crawler/` | `Fetch` (per-host rate limiter with per-host crawl delays, private-address guard, `robots.txt` rules and `Crawl-delay`, retry, content-type and size checks), `ExtractText` (case-preserving cleanup, entity decoding, boilerplate/comment stripping), `ExtractLinks` (quoted and unquoted hrefs, script/comment-safe), `NormalizeURL` (tracking parameters stripped), `CheckCrawlExclusions` (global and per-host path prefixes, query caps), `Tokenize`, `ContentFingerprint`. |
 | `engine/` | Worker pool, URL queue with depth tracking, dedupe sets, persistence, local plus distributed search, stats. |
 | `indexer/` | `Indexer` (documents, inverted index, URL lookup, prefix tries for autocomplete) and `LinkStore` (in-degree counts per URL). |
 | `trie/` | Path-segment trie keyed by host: subtree doc IDs (cluster boost) and depth. |
@@ -155,9 +164,11 @@ Everything is configured through environment variables:
    first, so a host the policy rejects or a path on the exclusion list is
    refused with an error instead of being queued.
 2. **Fetch** - a worker pulls the URL, waits on the per-host rate limiter, and
-   downloads up to 5 MB of `text/html`. Network errors are retried once;
-   HTTP errors are logged and skipped. Excluded URLs are refused before the
-   request is made and are never retried.
+   downloads up to 5 MB of `text/html`. The limiter leaves 200 ms between
+   requests to the same host, and a `Crawl-delay` in the site's `robots.txt`
+   raises that wait for that host. A network error is retried once right
+   away; HTTP errors are logged and skipped. Excluded URLs are refused before
+   the request is made and are never retried.
 3. **Dedupe** - the page text is fingerprinted (MD5 of the first 500 normalized
    characters); known fingerprints and already-indexed URLs are skipped.
 4. **Index** - text is tokenized (lowercased, `a-z0-9-` plus Unicode letters,
@@ -172,6 +183,12 @@ Everything is configured through environment variables:
    followed from a single page.
 6. **Accounting** - when a worker dequeues a URL it moves from pending to
    visited, so the "discovered" counter reflects real crawl progress.
+7. **Retry** - a URL that failed with a transient error goes back on the
+   queue and is fetched again once its retry window opens. The window starts
+   at `PALSPIDER_RETRY_DELAY` seconds and doubles with every attempt, and the
+   crawler gives up after three attempts. Failures that would look the same
+   on a second attempt, such as a refused host, an excluded path, or a `404`,
+   are dropped without a retry.
 
 ### Ranking
 
@@ -279,20 +296,18 @@ go test -race ./... # same, with the race detector (needs CGO / gcc)
 ```
 
 The test suite covers URL normalization, crawl exclusions (global and per host),
-robots rule precedence, per-host and per-page crawl budgets, text and link
-extraction, tokenizing, rate limiting, the private-address guard, trie
-concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
-persistence, result merging, document export (JSON and streaming NDJSON), and
-peer URL handling.
+robots rule precedence and crawl-delay parsing, per-host and per-page crawl
+budgets, retry requeueing, text and link extraction, tokenizing, rate limiting,
+the private-address guard, trie concurrency, index bookkeeping, prefix lookups,
+ranking and suggestions, batch persistence, result merging, document export
+(JSON and streaming NDJSON), and peer URL handling.
 
 ## Known issues
 
 Things that are still wrong or missing after the current round of fixes:
 
-1. **No sitemap ingestion.** The crawler honors `robots.txt` (set
-   `PALSPIDER_ALLOW_ROBOTS=0` to ignore it), but it does not read `sitemap.xml`
-   files, and there is no per-host politeness delay beyond the fixed 200 ms
-   limiter.
+1. **No sitemap ingestion.** The crawler honors `robots.txt`, including a
+   site's `Crawl-delay`, but it does not read `sitemap.xml` files.
 2. **Everything lives in RAM.** All documents and postings are held in memory,
    so a big crawl grows without bound. `PALSPIDER_MAX_PAGES`,
    `PALSPIDER_MAX_PAGES_PER_HOST`, and `PALSPIDER_MAX_DEPTH` are the only
@@ -335,8 +350,8 @@ Things that are still wrong or missing after the current round of fixes:
 
 ## Roadmap / possible features
 
-- robots.txt and sitemap ingestion, per-host politeness queues, crawl logs with
-  fetch failure reasons.
+- Sitemap ingestion, per-host politeness queues, crawl logs with fetch failure
+  reasons.
 - A PageRank pass over the collected link graph to complement TF-IDF.
 - Phrase queries ("..."), exclusion (-term), stemming, query-term highlighting
   in snippets, and `site:` style operators.

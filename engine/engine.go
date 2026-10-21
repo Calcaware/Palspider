@@ -3,10 +3,11 @@ package engine
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"net/url"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -25,7 +26,35 @@ const (
 	// bounds the total time a search may spend waiting on peers.
 	peerSearchTimeout = 1500 * time.Millisecond
 	peerSearchBudget  = 2 * time.Second
+
+	// maxRetries is how often a URL that failed with a transient error is
+	// fetched again before the crawler gives up on it.
+	maxRetries = 3
+
+	// defaultRetryWindow is the base wait before a failed URL is fetched
+	// again. The wait grows with every attempt so a host that stays down is
+	// not hammered.
+	defaultRetryWindow = time.Hour
 )
+
+// EnvRetryDelay names the variable that sets how long the crawler waits
+// before it fetches a failed URL again. The value is a number of seconds and
+// defaults to one hour.
+const EnvRetryDelay = "PALSPIDER_RETRY_DELAY"
+
+// retryWindowFromEnv reads the retry window from the environment. A missing,
+// unparsable, or non-positive value falls back to the default.
+func retryWindowFromEnv() time.Duration {
+	value := strings.TrimSpace(os.Getenv(EnvRetryDelay))
+	if value == "" {
+		return defaultRetryWindow
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		return defaultRetryWindow
+	}
+	return time.Duration(seconds) * time.Second
+}
 
 type crawlItem struct {
 	url   string
@@ -45,6 +74,7 @@ type Engine struct {
 	maxDepth    int
 	maxPages    int
 	maxPerHost  int
+	retryWindow time.Duration
 	urlChan     chan crawlItem
 	visited     map[string]struct{}
 	fpSeen      map[string]struct{}
@@ -111,6 +141,7 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 		maxDepth:    maxDepth,
 		maxPages:    maxPages,
 		maxPerHost:  crawler.MaxPagesPerHost(),
+		retryWindow: retryWindowFromEnv(),
 		urlChan:     make(chan crawlItem, 100000),
 		visited:     make(map[string]struct{}),
 		fpSeen:      make(map[string]struct{}),
@@ -577,6 +608,7 @@ func (e *Engine) Requeue(rawURL string) bool {
 	normalized := crawler.NormalizeURL(rawURL)
 	e.mu.Lock()
 	delete(e.retryAt, normalized)
+	delete(e.retryCounts, normalized)
 	delete(e.pending, normalized)
 	delete(e.visited, normalized)
 	if e.Store != nil {
@@ -746,18 +778,32 @@ func (e *Engine) worker(ctx context.Context) {
 				continue
 			}
 			if delay := e.retryDelay(item.url); delay > 0 {
-				go func(it crawlItem, d time.Duration) {
-					timer := time.NewTimer(d)
-					defer timer.Stop()
-					<-timer.C
-					e.enqueue(it, 5*time.Second)
-				}(item, delay)
+				e.parkRetry(ctx, item, delay)
 				continue
 			}
 			e.markDequeued(item)
 			e.processURL(ctx, item)
 		}
 	}
+}
+
+// parkRetry holds a URL until its retry window opens and then puts it back
+// on the queue. The wait ends early when the engine stops.
+func (e *Engine) parkRetry(ctx context.Context, item crawlItem, delay time.Duration) {
+	go func() {
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		if !e.enqueue(item, 5*time.Second) {
+			e.mu.Lock()
+			delete(e.pending, item.url)
+			e.mu.Unlock()
+		}
+	}()
 }
 
 func (e *Engine) retryDelay(rawURL string) time.Duration {
@@ -774,27 +820,68 @@ func (e *Engine) retryDelay(rawURL string) time.Duration {
 	return delay
 }
 
+// retryBackoff returns how long to wait before the next attempt of a URL
+// that already failed a number of times.
+func (e *Engine) retryBackoff(attempt int) time.Duration {
+	switch {
+	case attempt <= 1:
+		return e.retryWindow
+	case attempt == 2:
+		return 2 * e.retryWindow
+	default:
+		return 4 * e.retryWindow
+	}
+}
+
+// scheduleRetry puts a URL that failed with a transient error back on the
+// queue so it is fetched again once the retry window opens. Permanent
+// failures, such as a refused host, an excluded path, or a page that is not
+// there, are dropped instead, and a URL that keeps failing is given up on
+// once the retry budget is spent.
 func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
-	if err == nil || errors.Is(err, crawler.ErrExcluded) || strings.Contains(err.Error(), "blocked") || strings.Contains(err.Error(), "unsupported scheme") || strings.Contains(err.Error(), "invalid URL") || strings.Contains(err.Error(), "not allowed by policy") || strings.Contains(err.Error(), "robots.txt") {
+	if err == nil || crawler.IsPermanent(err) {
 		return
 	}
 
 	e.mu.Lock()
-	e.retryCounts[rawURL]++
-	e.retryAt[rawURL] = time.Now().Add(time.Hour)
+	attempt := e.retryCounts[rawURL] + 1
+	e.retryCounts[rawURL] = attempt
+	if attempt > maxRetries {
+		// The retry budget is spent, so the URL counts as visited and is
+		// not picked up again.
+		delete(e.retryAt, rawURL)
+		e.visited[rawURL] = struct{}{}
+		e.mu.Unlock()
+		if e.Store != nil {
+			e.Store.MarkVisited(rawURL)
+		}
+		return
+	}
+	e.retryAt[rawURL] = time.Now().Add(e.retryBackoff(attempt))
 	delete(e.visited, rawURL)
+	// The URL is marked pending so another page that links to it does not
+	// queue a second copy while the retry is waiting.
+	e.pending[rawURL] = struct{}{}
+	e.mu.Unlock()
+
 	if e.Store != nil {
 		e.Store.DeleteVisited(rawURL)
 	}
-	e.mu.Unlock()
+
+	if !e.enqueue(crawlItem{url: rawURL, depth: depth}, 0) {
+		e.mu.Lock()
+		delete(e.pending, rawURL)
+		e.mu.Unlock()
+	}
 }
 
 // markDequeued moves a URL from pending to visited so the "discovered" stat
-// reflects everything the crawler has picked up.
+// reflects everything the crawler has picked up. The retry count is kept so
+// a URL that keeps failing runs out of attempts instead of being retried
+// forever.
 func (e *Engine) markDequeued(item crawlItem) {
 	e.mu.Lock()
 	delete(e.pending, item.url)
-	delete(e.retryCounts, item.url)
 	_, known := e.visited[item.url]
 	if !known {
 		e.visited[item.url] = struct{}{}

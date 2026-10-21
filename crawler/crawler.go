@@ -25,16 +25,27 @@ import (
 // UserAgent identifies the crawler to remote servers.
 const UserAgent = "Palspider/0.2"
 
+// ErrPolicy marks a request the crawl policy refuses, such as a blocked
+// address, a host outside the allowlist, or a path robots.txt disallows.
+// Such a failure is permanent: another attempt would be refused the same
+// way, so callers drop the URL instead of retrying it.
+var ErrPolicy = errors.New("refused by crawl policy")
+
 type RateLimiter struct {
-	mu    sync.Mutex
-	last  map[string]time.Time
-	delay time.Duration
+	mu        sync.Mutex
+	last      map[string]time.Time
+	hostDelay map[string]time.Duration
+	delay     time.Duration
 }
 
 const limiterPruneSize = 4096
 
 func NewRateLimiter(delay time.Duration) *RateLimiter {
-	return &RateLimiter{last: make(map[string]time.Time), delay: delay}
+	return &RateLimiter{
+		last:      make(map[string]time.Time),
+		hostDelay: make(map[string]time.Duration),
+		delay:     delay,
+	}
 }
 
 // Wait blocks until the next request to host may start. Slots are reserved
@@ -46,11 +57,12 @@ func (r *RateLimiter) Wait(host string) {
 	if earliest, ok := r.last[host]; ok && earliest.After(now) {
 		start = earliest
 	}
-	r.last[host] = start.Add(r.delay)
+	r.last[host] = start.Add(r.delayFor(host))
 	if len(r.last) > limiterPruneSize {
 		for h, t := range r.last {
 			if t.Before(now) {
 				delete(r.last, h)
+				delete(r.hostDelay, h)
 			}
 		}
 	}
@@ -58,6 +70,43 @@ func (r *RateLimiter) Wait(host string) {
 	if wait := time.Until(start); wait > 0 {
 		time.Sleep(wait)
 	}
+}
+
+// delayFor returns the wait time that applies to host. The limiter lock must
+// be held while calling it.
+func (r *RateLimiter) delayFor(host string) time.Duration {
+	if d, ok := r.hostDelay[host]; ok && d > r.delay {
+		return d
+	}
+	return r.delay
+}
+
+// SetHostDelay raises the minimum wait between two requests to one host. A
+// delay that is shorter than the configured one is ignored, so a site can
+// slow the crawler down but never speed it up. The host's next slot is
+// pushed out so the longer wait applies to the very next request.
+func (r *RateLimiter) SetHostDelay(host string, delay time.Duration) {
+	if delay <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if delay <= r.delay {
+		return
+	}
+	r.hostDelay[host] = delay
+	if slot, ok := r.last[host]; ok {
+		if earliest := time.Now().Add(delay); earliest.After(slot) {
+			r.last[host] = earliest
+		}
+	}
+}
+
+// HostDelay returns the wait time currently applied to host.
+func (r *RateLimiter) HostDelay(host string) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.delayFor(host)
 }
 
 var defaultClient = &http.Client{
@@ -193,13 +242,13 @@ func checkHostPolicy(rawURL string) error {
 			}
 		}
 		if !allowed {
-			return fmt.Errorf("host %q not allowed by policy", host)
+			return fmt.Errorf("%w: host %q not allowed by policy", ErrPolicy, host)
 		}
 	}
 	deny := splitCSV(os.Getenv("PALSPIDER_DENYLIST"))
 	for _, p := range deny {
 		if matchesHostPattern(host, p) {
-			return fmt.Errorf("host %q blocked by policy", host)
+			return fmt.Errorf("%w: host %q blocked by policy", ErrPolicy, host)
 		}
 	}
 	return nil
@@ -212,10 +261,10 @@ func checkHostPolicy(rawURL string) error {
 func CheckURLPolicy(rawURL string) error {
 	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf("invalid URL")
+		return fmt.Errorf("%w: invalid URL", ErrPolicy)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("unsupported scheme %q", u.Scheme)
+		return fmt.Errorf("%w: unsupported scheme %q", ErrPolicy, u.Scheme)
 	}
 	if err := checkHostPolicy(u.String()); err != nil {
 		return err
@@ -239,11 +288,11 @@ func checkHostAllowed(hostport string) error {
 		return fmt.Errorf("empty host")
 	}
 	if strings.EqualFold(host, "localhost") {
-		return fmt.Errorf("blocked host %q", host)
+		return fmt.Errorf("%w: blocked host %q", ErrPolicy, host)
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		if blockedIP(ip) {
-			return fmt.Errorf("blocked address %s", ip)
+			return fmt.Errorf("%w: blocked address %s", ErrPolicy, ip)
 		}
 		return nil
 	}
@@ -253,7 +302,7 @@ func checkHostAllowed(hostport string) error {
 	}
 	for _, ip := range ips {
 		if blockedIP(ip) {
-			return fmt.Errorf("host %s resolves to blocked address %s", host, ip)
+			return fmt.Errorf("%w: host %s resolves to blocked address %s", ErrPolicy, host, ip)
 		}
 	}
 	return nil
@@ -278,7 +327,7 @@ func FetchContext(ctx context.Context, rawURL string, limiter *RateLimiter) (str
 		return "", err
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("unsupported scheme %q", u.Scheme)
+		return "", fmt.Errorf("%w: unsupported scheme %q", ErrPolicy, u.Scheme)
 	}
 	if err := checkHostAllowed(u.Host); err != nil {
 		return "", err
@@ -289,8 +338,14 @@ func FetchContext(ctx context.Context, rawURL string, limiter *RateLimiter) (str
 	if err := CheckCrawlExclusions(rawURL); err != nil {
 		return "", err
 	}
-	if !isRobotsAllowed(rawURL) {
-		return "", fmt.Errorf("robots.txt disallows %s", rawURL)
+	policy, allowed := robotsVerdict(rawURL)
+	if !allowed {
+		return "", fmt.Errorf("%w: robots.txt disallows %s", ErrPolicy, rawURL)
+	}
+	if policy != nil && limiter != nil {
+		// A site that asks for a longer pause than the configured one gets
+		// it, so the rate limiter slows down for that host.
+		limiter.SetHostDelay(u.Host, policy.crawlDelay)
 	}
 
 	if limiter != nil {
@@ -300,7 +355,7 @@ func FetchContext(ctx context.Context, rawURL string, limiter *RateLimiter) (str
 	body, err := doFetch(ctx, rawURL)
 	// A redirect into an excluded path or a rejected host fails the same way
 	// on every attempt, so it is not worth the second request.
-	if err != nil && !isServerError(err) && !errors.Is(err, ErrExcluded) && ctx.Err() == nil {
+	if err != nil && !isServerError(err) && !errors.Is(err, ErrExcluded) && !errors.Is(err, ErrPolicy) && ctx.Err() == nil {
 		if limiter != nil {
 			limiter.Wait(u.Host)
 		}
@@ -314,13 +369,46 @@ func FetchContext(ctx context.Context, rawURL string, limiter *RateLimiter) (str
 
 // serverError marks failures where the server responded, so retrying
 // immediately would not help.
-type serverError struct{ msg string }
+type serverError struct {
+	msg       string
+	status    int
+	permanent bool
+}
 
 func (e *serverError) Error() string { return e.msg }
 
 func isServerError(err error) bool {
 	var se *serverError
 	return errors.As(err, &se)
+}
+
+// IsPermanent reports whether a fetch failure would look the same on a
+// second attempt, so the caller can drop the URL instead of retrying it.
+// Policy refusals, excluded paths, and client errors are permanent, while
+// transport failures, timeouts, and server errors are worth another try.
+func IsPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrExcluded) || errors.Is(err, ErrPolicy) {
+		return true
+	}
+	var se *serverError
+	if errors.As(err, &se) {
+		return se.permanent
+	}
+	return false
+}
+
+// retryableStatus reports whether an HTTP status is worth another attempt.
+// Server errors and the two statuses that ask for a later retry are, other
+// client errors will not change.
+func retryableStatus(status int) bool {
+	switch status {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	}
+	return status >= 500
 }
 
 func doFetch(ctx context.Context, rawURL string) (string, error) {
@@ -337,7 +425,11 @@ func doFetch(ctx context.Context, rawURL string) (string, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", &serverError{fmt.Sprintf("HTTP %d", resp.StatusCode)}
+		return "", &serverError{
+			msg:       fmt.Sprintf("HTTP %d", resp.StatusCode),
+			status:    resp.StatusCode,
+			permanent: !retryableStatus(resp.StatusCode),
+		}
 	}
 
 	ct := resp.Header.Get("Content-Type")
@@ -355,7 +447,7 @@ func doFetch(ctx context.Context, rawURL string) (string, error) {
 		}
 		text, pdfErr := extractPDFText(body)
 		if pdfErr != nil {
-			return "", &serverError{fmt.Sprintf("unsupported content-type: %s", ct)}
+			return "", &serverError{msg: fmt.Sprintf("unsupported content-type: %s", ct), status: resp.StatusCode, permanent: true}
 		}
 		return text, nil
 	}
@@ -366,12 +458,12 @@ func doFetch(ctx context.Context, rawURL string) (string, error) {
 		}
 		text, docErr := extractDocText(body)
 		if docErr != nil {
-			return "", &serverError{fmt.Sprintf("unsupported content-type: %s", ct)}
+			return "", &serverError{msg: fmt.Sprintf("unsupported content-type: %s", ct), status: resp.StatusCode, permanent: true}
 		}
 		return text, nil
 	}
 
-	return "", &serverError{fmt.Sprintf("unsupported content-type: %s", ct)}
+	return "", &serverError{msg: fmt.Sprintf("unsupported content-type: %s", ct), status: resp.StatusCode, permanent: true}
 }
 
 func extractPDFText(data []byte) (string, error) {

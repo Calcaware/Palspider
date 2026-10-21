@@ -293,6 +293,113 @@ func TestRobotsRulePrecedence(t *testing.T) {
 	}
 }
 
+func TestParseRobotsPolicyReadsCrawlDelay(t *testing.T) {
+	policy := parseRobotsPolicy("User-agent: *\nCrawl-delay: 5\nDisallow: /private\n")
+	if policy == nil {
+		t.Fatal("parseRobotsPolicy returned nil for a file with rules")
+	}
+	if policy.crawlDelay != 5*time.Second {
+		t.Errorf("crawl delay = %v, want 5s", policy.crawlDelay)
+	}
+	if len(policy.deny) != 1 || policy.deny[0] != "/private" {
+		t.Errorf("deny = %v, want the /private rule", policy.deny)
+	}
+}
+
+func TestParseRobotsPolicyPrefersTheMatchingGroup(t *testing.T) {
+	body := "User-agent: *\nDisallow: /\nCrawl-delay: 30\n\n" +
+		"User-agent: Palspider\nDisallow: /private\nCrawl-delay: 2\n"
+	policy := parseRobotsPolicy(body)
+	if policy == nil {
+		t.Fatal("parseRobotsPolicy returned nil for a file with rules")
+	}
+	if len(policy.deny) != 1 || policy.deny[0] != "/private" {
+		t.Errorf("deny = %v, want only the rule of the group that names the crawler", policy.deny)
+	}
+	if policy.crawlDelay != 2*time.Second {
+		t.Errorf("crawl delay = %v, want the delay of the matching group", policy.crawlDelay)
+	}
+}
+
+func TestParseRobotsPolicyIgnoresOtherCrawlers(t *testing.T) {
+	body := "User-agent: Googlebot\nDisallow: /\nCrawl-delay: 60\n"
+	if policy := parseRobotsPolicy(body); policy != nil {
+		t.Errorf("parseRobotsPolicy = %+v, want nil for a file that names another crawler", policy)
+	}
+}
+
+func TestParseRobotsPolicyCombinesGroupsOfTheSameAgent(t *testing.T) {
+	body := "User-agent: Palspider\nDisallow: /a\n\nUser-agent: Palspider\nDisallow: /b\n"
+	policy := parseRobotsPolicy(body)
+	if policy == nil {
+		t.Fatal("parseRobotsPolicy returned nil for a file with rules")
+	}
+	if len(policy.deny) != 2 {
+		t.Errorf("deny = %v, want the rules of both groups", policy.deny)
+	}
+}
+
+func TestParseCrawlDelay(t *testing.T) {
+	cases := []struct {
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{"5", 5 * time.Second, true},
+		{"0.5", 500 * time.Millisecond, true},
+		{" 10 ", 10 * time.Second, true},
+		{"0", 0, false},
+		{"-1", 0, false},
+		{"soon", 0, false},
+		{"", 0, false},
+		{"3600", maxCrawlDelay, true},
+	}
+	for _, c := range cases {
+		got, ok := parseCrawlDelay(c.value)
+		if ok != c.ok || got != c.want {
+			t.Errorf("parseCrawlDelay(%q) = %v, %v, want %v, %v", c.value, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestFetchAppliesCrawlDelayToTheLimiter(t *testing.T) {
+	t.Setenv("PALSPIDER_ALLOW_PRIVATE", "1")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/robots.txt" {
+			io.WriteString(w, "User-agent: *\nCrawl-delay: 2\n")
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte("<html><body>page body</body></html>"))
+	}))
+	defer srv.Close()
+
+	limiter := NewRateLimiter(200 * time.Millisecond)
+	if _, err := Fetch(srv.URL+"/page", limiter); err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+
+	host := strings.TrimPrefix(srv.URL, "http://")
+	if got := limiter.HostDelay(host); got != 2*time.Second {
+		t.Errorf("host delay = %v, want the 2s the site asked for", got)
+	}
+}
+
+func TestIsPermanent(t *testing.T) {
+	if IsPermanent(nil) {
+		t.Error("IsPermanent(nil) = true, want false")
+	}
+	if !IsPermanent(fmt.Errorf("%w: host %q", ErrPolicy, "example.com")) {
+		t.Error("a policy refusal should be permanent")
+	}
+	if !IsPermanent(fmt.Errorf("%w: path %q", ErrExcluded, "/search")) {
+		t.Error("an excluded path should be permanent")
+	}
+	if IsPermanent(errors.New("connection reset by peer")) {
+		t.Error("a transport failure should not be permanent")
+	}
+}
+
 func TestFetchAllowsPrivateWhenConfigured(t *testing.T) {
 	t.Setenv("PALSPIDER_ALLOW_PRIVATE", "1")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -350,5 +457,30 @@ func TestRateLimiterPrunesStaleEntries(t *testing.T) {
 	r.mu.Unlock()
 	if size >= limiterPruneSize {
 		t.Errorf("rate limiter map not pruned: %d entries", size)
+	}
+}
+
+func TestRateLimiterHonorsHostDelay(t *testing.T) {
+	r := NewRateLimiter(10 * time.Millisecond)
+	r.SetHostDelay("slow.example", 150*time.Millisecond)
+
+	start := time.Now()
+	r.Wait("slow.example")
+	r.Wait("slow.example")
+	elapsed := time.Since(start)
+	if elapsed < 150*time.Millisecond {
+		t.Errorf("two waits on a slow host took %v, want at least the 150ms host delay", elapsed)
+	}
+	if got := r.HostDelay("slow.example"); got != 150*time.Millisecond {
+		t.Errorf("host delay = %v, want 150ms", got)
+	}
+}
+
+func TestRateLimiterHostDelayNeverShortensTheWait(t *testing.T) {
+	r := NewRateLimiter(100 * time.Millisecond)
+	r.SetHostDelay("fast.example", 10*time.Millisecond)
+
+	if got := r.HostDelay("fast.example"); got != 100*time.Millisecond {
+		t.Errorf("host delay = %v, want the configured 100ms to stay in place", got)
 	}
 }
