@@ -2,7 +2,7 @@
 
 This document is a prioritized plan to address the main risks, correctness gaps, and feature opportunities identified in the current codebase.
 
-Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling, host allowlists and denylists, crawl exclusions for noisy paths (globally and per host) and oversized query strings, per-host and per-page crawl budgets, and the `Crawl-delay` a site asks for in its robots.txt. The remaining unchecked items in section 1.2, the stay-in-scope rule and persisted per-host page counts, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
+Status note: the retry policy, peer hardening, and observability work in sections 1.1, 1.3, and 1.4 is implemented in the codebase, and section 1.2 covers robots.txt handling, host allowlists and denylists, crawl exclusions for noisy paths (globally and per host) and oversized query strings, per-host and per-page crawl budgets, and the `Crawl-delay` a site asks for in its robots.txt. The retry backoff carries a jitter of up to a tenth of the window, so a group of workers does not hit a recovered host all at once, and clearing the crawl queue drops the retries that are waiting on their window instead of letting them come back on their own. The remaining unchecked items in section 1.2, the stay-in-scope rule and persisted per-host page counts, are feature-roadmap or product-quality improvements intended for future milestones rather than required correctness fixes.
 
 ## 1. High-priority fixes
 
@@ -16,8 +16,9 @@ Tasks:
 - [x] Requeue transient failures through a lightweight retry window so failed pages can be revisited without losing crawl progress.
 - [x] Limit retries to a bounded retry window instead of leaving failed pages permanently blacklisted.
 - [x] Add tests covering temporary retries and queue re-entry behavior.
-- [ ] Add jitter to the retry backoff so a group of workers does not hit a recovered host all at once.
+- [x] Add jitter to the retry backoff so a group of workers does not hit a recovered host all at once.
 - [ ] Add a per-host retry budget so one unreachable site cannot keep the frontier busy.
+- [ ] Report the URLs that are waiting on a retry window in the crawl status, so operators can see what the frontier is holding.
 
 Why:
 - Right now, the crawler marks a URL as visited when it is dequeued, even before the fetch succeeds. That makes the system efficient, but it reduces recoverability when a page fails for temporary reasons.

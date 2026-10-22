@@ -334,7 +334,7 @@ func TestDiscoverSkipsPerHostExcludedLinks(t *testing.T) {
 	}
 }
 
-func TestScheduleRetryDefersFailuresForOneHour(t *testing.T) {
+func TestScheduleRetryDefersFailuresForAboutAnHour(t *testing.T) {
 	e := New(1, 10, 0, nil)
 	url := "https://example.com/retry"
 	e.mu.Lock()
@@ -349,11 +349,114 @@ func TestScheduleRetryDefersFailuresForOneHour(t *testing.T) {
 	if !exists {
 		t.Fatal("retry timestamp missing after failure")
 	}
-	if wait := time.Until(at); wait < 59*time.Minute || wait > time.Hour+time.Minute {
-		t.Fatalf("retry window = %v, want roughly 1 hour", wait)
+	// The wait carries a jitter of up to a tenth of the window.
+	low := time.Hour - time.Hour*retryJitterPercent/100
+	high := time.Hour + time.Hour*retryJitterPercent/100
+	if wait := time.Until(at); wait < low || wait > high {
+		t.Fatalf("retry window = %v, want between %v and %v", wait, low, high)
 	}
-	if delay := e.retryDelay(url); delay <= 0 || delay > time.Hour {
-		t.Fatalf("retryDelay = %v, want a positive delay within 1 hour", delay)
+	if delay := e.retryDelay(url); delay <= 0 || delay > high {
+		t.Fatalf("retryDelay = %v, want a positive delay within %v", delay, high)
+	}
+}
+
+func TestRetryBackoffGrowsWithEveryAttempt(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.retryWindow = time.Hour
+
+	cases := []struct {
+		attempt int
+		base    time.Duration
+	}{
+		{1, time.Hour},
+		{2, 2 * time.Hour},
+		{3, 4 * time.Hour},
+		{4, 4 * time.Hour},
+	}
+	for _, c := range cases {
+		got := e.retryBackoff(c.attempt)
+		low := c.base - c.base*retryJitterPercent/100
+		high := c.base + c.base*retryJitterPercent/100
+		if got < low || got > high {
+			t.Errorf("retryBackoff(%d) = %v, want between %v and %v", c.attempt, got, low, high)
+		}
+	}
+}
+
+func TestRetryBackoffJittersTheWait(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.retryWindow = time.Hour
+
+	low := time.Hour - time.Hour*retryJitterPercent/100
+	high := time.Hour + time.Hour*retryJitterPercent/100
+	seen := make(map[time.Duration]struct{})
+	var minWait, maxWait time.Duration
+	for i := 0; i < 200; i++ {
+		got := e.retryBackoff(1)
+		if got < low || got > high {
+			t.Fatalf("retryBackoff(1) = %v, want between %v and %v", got, low, high)
+		}
+		seen[got] = struct{}{}
+		if minWait == 0 || got < minWait {
+			minWait = got
+		}
+		if got > maxWait {
+			maxWait = got
+		}
+	}
+	if len(seen) < 2 {
+		t.Fatal("retryBackoff returned the same wait every time, so the jitter does nothing")
+	}
+	if maxWait-minWait < time.Minute {
+		t.Errorf("jitter spread = %v, want the waits to be spread out", maxWait-minWait)
+	}
+}
+
+func TestRetryBackoffSeparatesAttempts(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.retryWindow = time.Hour
+
+	first := e.retryBackoff(1)
+	second := e.retryBackoff(2)
+	if second <= first {
+		t.Errorf("retryBackoff(2) = %v, want more than the first attempt wait %v", second, first)
+	}
+}
+
+func TestClearQueueDropsParkedRetries(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	url := "https://example.com/retry"
+	e.scheduleRetry(url, 0, errors.New("temporary network failure"))
+
+	// A worker parks the URL while its retry window is still open.
+	item := <-e.urlChan
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	e.parkRetry(ctx, item, 50*time.Millisecond)
+
+	e.ClearQueue()
+	time.Sleep(200 * time.Millisecond)
+
+	if len(e.urlChan) != 0 {
+		t.Fatalf("queue = %d items, want a parked retry to stay dropped", len(e.urlChan))
+	}
+}
+
+func TestClearQueueForgetsDroppedURLs(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/page")
+	e.ClearQueue()
+
+	e.mu.Lock()
+	_, visited := e.visited["https://example.com/page"]
+	e.mu.Unlock()
+	if visited {
+		t.Error("a cleared URL is still marked visited, so it can never be crawled again")
+	}
+
+	e.Seed("https://example.com/page")
+	if len(e.urlChan) != 1 {
+		t.Fatalf("queue = %d items, want the cleared URL to be seedable again", len(e.urlChan))
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"sort"
@@ -35,6 +36,11 @@ const (
 	// again. The wait grows with every attempt so a host that stays down is
 	// not hammered.
 	defaultRetryWindow = time.Hour
+
+	// retryJitterPercent is how far a retry wait may drift from its base
+	// window in either direction. The spread keeps a group of workers from
+	// hitting a recovered host all at once.
+	retryJitterPercent = 10
 )
 
 // EnvRetryDelay names the variable that sets how long the crawler waits
@@ -81,6 +87,7 @@ type Engine struct {
 	pending     map[string]struct{}
 	retryCounts map[string]int
 	retryAt     map[string]time.Time
+	queueGen    uint64
 	hostStats   map[string]HostStat
 	hostDocs    map[string]int
 	paused      bool
@@ -584,16 +591,15 @@ func (e *Engine) Suggest(prefix string, limit int) []string {
 	return e.Searcher.Suggest(prefix, limit)
 }
 
+// ClearQueue drops everything that is waiting and forgets the URLs it
+// dropped, so a later seed or link can pick them up again. Retries that are
+// parked on their window are dropped as well, otherwise the queue fills up
+// again on its own once those windows open.
 func (e *Engine) ClearQueue() {
-	for {
-		select {
-		case <-e.urlChan:
-		default:
-			goto done
-		}
-	}
-done:
 	e.mu.Lock()
+	// The generation tells a parked retry that the queue was cleared while
+	// it was waiting, so it does not put its URL back.
+	e.queueGen++
 	for url := range e.pending {
 		delete(e.pending, url)
 	}
@@ -601,6 +607,27 @@ done:
 		delete(e.retryAt, url)
 	}
 	e.mu.Unlock()
+
+	var dropped []string
+	for {
+		select {
+		case item := <-e.urlChan:
+			// A dropped URL is not visited any more, so it can be crawled
+			// again later.
+			e.mu.Lock()
+			delete(e.visited, item.url)
+			e.mu.Unlock()
+			dropped = append(dropped, item.url)
+			continue
+		default:
+		}
+		break
+	}
+	if e.Store != nil && len(dropped) > 0 {
+		if err := e.Store.DeleteVisitedBatch(dropped); err != nil {
+			log.Printf("clear queue: %v", err)
+		}
+	}
 	atomic.StoreInt32(&e.queueSize, 0)
 }
 
@@ -788,8 +815,13 @@ func (e *Engine) worker(ctx context.Context) {
 }
 
 // parkRetry holds a URL until its retry window opens and then puts it back
-// on the queue. The wait ends early when the engine stops.
+// on the queue. The wait ends early when the engine stops, and a queue that
+// is cleared in the meantime drops the URL instead of restoring it.
 func (e *Engine) parkRetry(ctx context.Context, item crawlItem, delay time.Duration) {
+	e.mu.Lock()
+	gen := e.queueGen
+	e.mu.Unlock()
+
 	go func() {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
@@ -798,11 +830,19 @@ func (e *Engine) parkRetry(ctx context.Context, item crawlItem, delay time.Durat
 			return
 		case <-timer.C:
 		}
-		if !e.enqueue(item, 5*time.Second) {
-			e.mu.Lock()
+		// The URL goes back on the queue while the lock is held, so a queue
+		// clear either happens before this check or after the push, never
+		// in between.
+		e.mu.Lock()
+		if e.queueGen != gen {
 			delete(e.pending, item.url)
 			e.mu.Unlock()
+			return
 		}
+		if !e.enqueue(item, 0) {
+			delete(e.pending, item.url)
+		}
+		e.mu.Unlock()
 	}()
 }
 
@@ -821,16 +861,29 @@ func (e *Engine) retryDelay(rawURL string) time.Duration {
 }
 
 // retryBackoff returns how long to wait before the next attempt of a URL
-// that already failed a number of times.
+// that already failed a number of times. The wait grows with every attempt
+// and carries a random jitter, so a group of workers that failed on the
+// same host does not hit it again all at once.
 func (e *Engine) retryBackoff(attempt int) time.Duration {
+	var base time.Duration
 	switch {
 	case attempt <= 1:
-		return e.retryWindow
+		base = e.retryWindow
 	case attempt == 2:
-		return 2 * e.retryWindow
+		base = 2 * e.retryWindow
 	default:
-		return 4 * e.retryWindow
+		base = 4 * e.retryWindow
 	}
+	if base <= 0 {
+		return 0
+	}
+	// The wait drifts by up to a tenth of the window in either direction, so
+	// the backoff keeps its shape while the exact moment moves.
+	spread := int64(base * retryJitterPercent / 100)
+	if spread < 1 {
+		spread = 1
+	}
+	return base + time.Duration(rand.Int64N(2*spread+1)-spread)
 }
 
 // scheduleRetry puts a URL that failed with a transient error back on the

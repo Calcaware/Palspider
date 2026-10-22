@@ -24,9 +24,10 @@ deduplicated by URL, and peer lists gossip automatically.
   asks for a longer wait than the configured 200 ms.
 - **Retries** - a page that fails with a transient error (network fault,
   timeout, `5xx`, `408`, or `429`) is put back on the queue and fetched again
-  after a growing wait, up to three attempts in total. Failures that would
-  look the same on a second attempt (a refused host, an excluded path, a
-  `4xx`) are dropped at once.
+  after a growing wait, up to three attempts in total. The wait carries a
+  jitter of up to a tenth so a group of workers does not hit a recovered host
+  all at once. Failures that would look the same on a second attempt (a
+  refused host, an excluded path, a `4xx`) are dropped at once.
 - **Safety** - the crawler refuses loopback, link-local, and private addresses
   by default so a malicious seed URL cannot probe your LAN or cloud metadata
   endpoint. Set `PALSPIDER_ALLOW_PRIVATE=1` to crawl local hosts on purpose.
@@ -103,7 +104,7 @@ Everything is configured through environment variables:
 | `PALSPIDER_MAX_QUERY_PARAMS` | `8` | Skip URLs with more query parameters than this, which is how faceted and session-id crawl traps are cut off. `0` or a negative value means unlimited. |
 | `PALSPIDER_MAX_QUERY_LENGTH` | `1024` | Skip URLs whose raw query string is longer than this many bytes. `0` or a negative value means unlimited. |
 | `PALSPIDER_ALLOW_ROBOTS` | `1` | Set to `0` to ignore `robots.txt` rules and crawl disallowed paths anyway. |
-| `PALSPIDER_RETRY_DELAY` | `3600` | Seconds to wait before a page that failed with a transient error is fetched again. The wait doubles with every attempt, and the crawler gives up after three attempts. |
+| `PALSPIDER_RETRY_DELAY` | `3600` | Seconds to wait before a page that failed with a transient error is fetched again. The wait doubles with every attempt, drifts by up to a tenth so workers do not hit a recovered host all at once, and the crawler gives up after three attempts. |
 | `PALSPIDER_AUTH` | unset | `user:pass` - require Basic credentials on `POST`/`DELETE` API routes. |
 | `PALSPIDER_PUBLIC_RATE_LIMIT` | unset | Optional per-IP GET request cap within a rolling 60-second window. Example: `60` allows 60 public GETs per minute before returning `429`. |
 | `PALSPIDER_PEER_TOKEN` | unset | Optional bearer token used for peer mesh search and gossip traffic. |
@@ -186,9 +187,11 @@ Everything is configured through environment variables:
 7. **Retry** - a URL that failed with a transient error goes back on the
    queue and is fetched again once its retry window opens. The window starts
    at `PALSPIDER_RETRY_DELAY` seconds and doubles with every attempt, and the
-   crawler gives up after three attempts. Failures that would look the same
-   on a second attempt, such as a refused host, an excluded path, or a `404`,
-   are dropped without a retry.
+   crawler gives up after three attempts. Every wait drifts by up to a tenth
+   of the window, so a group of workers that failed on the same host does not
+   come back to it all at once. Failures that would look the same on a second
+   attempt, such as a refused host, an excluded path, or a `404`, are dropped
+   without a retry.
 
 ### Ranking
 
@@ -257,6 +260,10 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `GET /api/export?limit=100&offset=0&format=json` | Paginated export of indexed documents (`id`, `url`, `title`, `text`, `linkCount`). `limit` clamps to [1, 1000]; `format=ndjson` streams one document per line. |
 | `GET /api/crawl` | Alias of `GET /crawl-status`. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
+| `POST /api/crawl/pause` | Stop the workers from picking up new URLs. |
+| `POST /api/crawl/resume` | Let the workers pick up URLs again. |
+| `POST /api/crawl/clear` | Drop the queued URLs and forget them, so they can be crawled again. |
+| `POST /api/crawl/requeue` | `{"url":"..."}` - crawl one URL again and reset its retry budget. |
 | `GET /api/suggest?q=...&limit=5` | Alias of `GET /suggest` (term, phrase, and domain hints). |
 | `GET /api/peers` | List registered peers with status and last-seen. |
 | `POST /api/peers` | `{"url":"http://host:3000"}` - validate and add a peer. |
@@ -297,10 +304,11 @@ go test -race ./... # same, with the race detector (needs CGO / gcc)
 
 The test suite covers URL normalization, crawl exclusions (global and per host),
 robots rule precedence and crawl-delay parsing, per-host and per-page crawl
-budgets, retry requeueing, text and link extraction, tokenizing, rate limiting,
-the private-address guard, trie concurrency, index bookkeeping, prefix lookups,
-ranking and suggestions, batch persistence, result merging, document export
-(JSON and streaming NDJSON), and peer URL handling.
+budgets, retry requeueing and backoff jitter, queue clearing, text and link
+extraction, tokenizing, rate limiting, the private-address guard, trie
+concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
+persistence, result merging, document export (JSON and streaming NDJSON), and peer
+URL handling.
 
 ## Known issues
 

@@ -97,6 +97,36 @@ func TestSaveDocumentBatchRoundtrip(t *testing.T) {
 	}
 }
 
+func TestDeleteVisitedBatch(t *testing.T) {
+	s := openTestStore(t)
+
+	for _, url := range []string{"https://a.com/", "https://b.com/", "https://c.com/"} {
+		if err := s.MarkVisited(url); err != nil {
+			t.Fatalf("MarkVisited: %v", err)
+		}
+	}
+
+	if err := s.DeleteVisitedBatch([]string{"https://a.com/", "https://c.com/"}); err != nil {
+		t.Fatalf("DeleteVisitedBatch: %v", err)
+	}
+
+	visited := []string{}
+	if err := s.AllVisited(func(url string) error {
+		visited = append(visited, url)
+		return nil
+	}); err != nil {
+		t.Fatalf("AllVisited: %v", err)
+	}
+	if len(visited) != 1 || visited[0] != "https://b.com/" {
+		t.Errorf("visited = %v, want only https://b.com/", visited)
+	}
+
+	// An empty batch is a no-op.
+	if err := s.DeleteVisitedBatch(nil); err != nil {
+		t.Fatalf("DeleteVisitedBatch(nil): %v", err)
+	}
+}
+
 func TestVisitedAndFingerprints(t *testing.T) {
 	s := openTestStore(t)
 

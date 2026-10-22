@@ -155,6 +155,23 @@ func (s *Store) DeleteVisited(url string) error {
 	})
 }
 
+// DeleteVisitedBatch removes several URLs from the visited set in one
+// transaction, so clearing a large queue does not cost one commit per URL.
+func (s *Store) DeleteVisitedBatch(urls []string) error {
+	if len(urls) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("visited"))
+		for _, url := range urls {
+			if err := bucket.Delete([]byte(url)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (s *Store) AllVisited(fn func(url string) error) error {
 	return s.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("visited")).ForEach(func(k, _ []byte) error {

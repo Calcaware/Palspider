@@ -37,7 +37,7 @@ with a new API version or compatibility notes in release documentation.
 | Code | Meaning |
 |---|---|
 | `200` | Success. |
-| `202` | Accepted (used by `POST /api/crawl`). |
+| `202` | Accepted (used by `POST /api/crawl` and `POST /api/crawl/requeue`). |
 | `400` | Bad request: missing/invalid parameter or body. |
 | `401` | Missing or wrong credentials (only when `PALSPIDER_AUTH` is set). |
 | `404` | Unknown `/api/*` path. |
@@ -341,9 +341,11 @@ crawl.
 A page that fails with a transient error, such as a network fault, a timeout,
 a `5xx`, a `408`, or a `429`, is queued again and fetched once more after
 `PALSPIDER_RETRY_DELAY` seconds (default `3600`). The wait doubles with every
-attempt and the crawler gives up after three attempts. Failures that would
-look the same on a second attempt, such as a refused host, an excluded path,
-or a `404`, are dropped right away.
+attempt and the crawler gives up after three attempts. Every wait also drifts
+by up to a tenth of the window in either direction, so a group of workers that
+failed on the same host does not come back to it all at once. Failures that
+would look the same on a second attempt, such as a refused host, an excluded
+path, or a `404`, are dropped right away.
 
 The crawl exclusion rules apply to seeds as well. A URL on a path listed in
 `PALSPIDER_EXCLUDE_PATHS` (defaults to `/search, /login`), with more query
@@ -366,6 +368,50 @@ links are followed from a single page, and `PALSPIDER_MAX_PAGES_PER_HOST`
 (default unset, meaning unlimited) caps how many indexed pages one host may
 contribute. Links outside either budget are still counted for in-degree but are
 not queued. The full list of variables is in the README.
+
+### `POST /api/crawl/pause` and `POST /api/crawl/resume`
+
+Stop and start the workers. A paused crawler keeps accepting seeds and keeps
+discovering links, but no worker picks a URL up. Both endpoints take no body
+and answer `200`:
+
+```json
+{"status":"ok","paused":true}
+```
+
+The paused flag is also reported by `GET /api/status` as `paused`.
+
+### `POST /api/crawl/clear`
+
+Drop everything that is waiting to be crawled and forget the URLs that were
+dropped, so a later seed or link can pick them up again. Retries that are
+waiting on their window are dropped as well, so the queue does not fill up
+again on its own once those windows open. The endpoint takes no body and
+answers `200`:
+
+```json
+{"status":"ok","queueSize":0}
+```
+
+### `POST /api/crawl/requeue`
+
+Crawl one URL again, even if it was crawled before. The retry budget of that
+URL is reset, so it gets the full set of attempts again.
+
+Request body:
+
+```json
+{"url":"https://example.org/docs"}
+```
+
+Success (`202 Accepted`):
+
+```json
+{"status":"accepted","url":"https://example.org/docs"}
+```
+
+`url` is the normalized form. Errors: `400` with a JSON error object when the
+body is not valid JSON, the `url` is empty, or the URL could not be queued.
 
 ### `GET /api/suggest` and `GET /suggest`
 
