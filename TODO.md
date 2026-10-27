@@ -17,8 +17,8 @@ Tasks:
 - [x] Limit retries to a bounded retry window instead of leaving failed pages permanently blacklisted.
 - [x] Add tests covering temporary retries and queue re-entry behavior.
 - [x] Add jitter to the retry backoff so a group of workers does not hit a recovered host all at once.
-- [ ] Add a per-host retry budget so one unreachable site cannot keep the frontier busy.
-- [ ] Report the URLs that are waiting on a retry window in the crawl status, so operators can see what the frontier is holding.
+- [x] Add a per-host retry budget so one unreachable site cannot keep the frontier busy.
+- [x] Report the URLs that are waiting on a retry window in the crawl status, so operators can see what the frontier is holding.
 
 Why:
 - Right now, the crawler marks a URL as visited when it is dequeued, even before the fetch succeeds. That makes the system efficient, but it reduces recoverability when a page fails for temporary reasons.

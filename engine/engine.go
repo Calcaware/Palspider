@@ -48,6 +48,17 @@ const (
 // defaults to one hour.
 const EnvRetryDelay = "PALSPIDER_RETRY_DELAY"
 
+// EnvRetryBudgetPerHost names the variable that caps how many failed URLs from
+// one host may wait on a retry at the same time. The value is a count and
+// defaults to defaultRetryBudgetPerHost; zero or a negative value means
+// unlimited.
+const EnvRetryBudgetPerHost = "PALSPIDER_RETRY_BUDGET_PER_HOST"
+
+// defaultRetryBudgetPerHost keeps one unreachable site from filling the
+// frontier with parked retries while still leaving room for a site that had a
+// short outage to recover.
+const defaultRetryBudgetPerHost = 32
+
 // retryWindowFromEnv reads the retry window from the environment. A missing,
 // unparsable, or non-positive value falls back to the default.
 func retryWindowFromEnv() time.Duration {
@@ -60,6 +71,21 @@ func retryWindowFromEnv() time.Duration {
 		return defaultRetryWindow
 	}
 	return time.Duration(seconds) * time.Second
+}
+
+// retryBudgetFromEnv reads the per-host retry budget from the environment. A
+// missing or unparsable value falls back to the default; zero or a negative
+// value disables the budget.
+func retryBudgetFromEnv() int {
+	value := strings.TrimSpace(os.Getenv(EnvRetryBudgetPerHost))
+	if value == "" {
+		return defaultRetryBudgetPerHost
+	}
+	budget, err := strconv.Atoi(value)
+	if err != nil {
+		return defaultRetryBudgetPerHost
+	}
+	return budget
 }
 
 type crawlItem struct {
@@ -81,12 +107,14 @@ type Engine struct {
 	maxPages    int
 	maxPerHost  int
 	retryWindow time.Duration
+	retryBudget int
 	urlChan     chan crawlItem
 	visited     map[string]struct{}
 	fpSeen      map[string]struct{}
 	pending     map[string]struct{}
 	retryCounts map[string]int
 	retryAt     map[string]time.Time
+	hostRetries map[string]int
 	queueGen    uint64
 	hostStats   map[string]HostStat
 	hostDocs    map[string]int
@@ -116,15 +144,26 @@ type Stats struct {
 	HostStats map[string]HostStat `json:"hostStats"`
 }
 
+type RetryStatus struct {
+	URL    string `json:"url"`
+	Host   string `json:"host"`
+	RetryAt string `json:"retryAt"`
+	In     int64  `json:"inSeconds"`
+}
+
 type CrawlStatus struct {
-	QueueSize int32               `json:"queueSize"`
-	Active    int32               `json:"active"`
-	Crawling  bool                `json:"crawling"`
-	Visited   int                 `json:"visited"`
-	Documents int                 `json:"documents"`
-	Terms     int                 `json:"terms"`
-	Paused    bool                `json:"paused"`
-	HostStats map[string]HostStat `json:"hostStats"`
+	QueueSize   int32               `json:"queueSize"`
+	Active      int32               `json:"active"`
+	Crawling    bool                `json:"crawling"`
+	Visited     int                 `json:"visited"`
+	Documents   int                 `json:"documents"`
+	Terms       int                 `json:"terms"`
+	Paused      bool                `json:"paused"`
+	HostStats   map[string]HostStat `json:"hostStats"`
+	Retrying    int                 `json:"retrying"`
+	RetryBudget int                 `json:"retryBudget"`
+	RetryQueues map[string]int      `json:"retryQueues,omitempty"`
+	Retries     []RetryStatus       `json:"retries,omitempty"`
 }
 
 // New creates an engine. maxDepth < 0 means unlimited crawl depth; maxPages
@@ -149,12 +188,14 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 		maxPages:    maxPages,
 		maxPerHost:  crawler.MaxPagesPerHost(),
 		retryWindow: retryWindowFromEnv(),
+		retryBudget: retryBudgetFromEnv(),
 		urlChan:     make(chan crawlItem, 100000),
 		visited:     make(map[string]struct{}),
 		fpSeen:      make(map[string]struct{}),
 		pending:     make(map[string]struct{}),
 		retryCounts: make(map[string]int),
 		retryAt:     make(map[string]time.Time),
+		hostRetries: make(map[string]int),
 		hostStats:   make(map[string]HostStat),
 		hostDocs:    make(map[string]int),
 	}
@@ -606,6 +647,12 @@ func (e *Engine) ClearQueue() {
 	for url := range e.retryAt {
 		delete(e.retryAt, url)
 	}
+	for url := range e.retryCounts {
+		delete(e.retryCounts, url)
+	}
+	for host := range e.hostRetries {
+		delete(e.hostRetries, host)
+	}
 	e.mu.Unlock()
 
 	var dropped []string
@@ -760,18 +807,41 @@ func (e *Engine) CrawlStatus() CrawlStatus {
 	for k, v := range e.hostStats {
 		hosts[k] = v
 	}
+	retryQueues := make(map[string]int, len(e.hostRetries))
+	for h, c := range e.hostRetries {
+		retryQueues[h] = c
+	}
+	retries := make([]RetryStatus, 0, len(e.retryAt))
+	for u, at := range e.retryAt {
+		in := int64(time.Until(at).Seconds())
+		if in < 0 {
+			in = 0
+		}
+		retries = append(retries, RetryStatus{
+			URL:      u,
+			Host:     hostOf(u),
+			RetryAt:  at.Format(time.RFC3339),
+			In:       in,
+		})
+	}
+	retrying := len(e.retryAt)
+	retryBudget := e.retryBudget
 	e.mu.Unlock()
 	queueSize := atomic.LoadInt32(&e.queueSize)
 	active := atomic.LoadInt32(&e.active)
 	return CrawlStatus{
-		QueueSize: queueSize,
-		Active:    active,
-		Crawling:  active > 0 || queueSize > 0,
-		Visited:   visited,
-		Documents: e.Indexer.DocCount(),
-		Terms:     e.Indexer.TermCount(),
-		Paused:    paused,
-		HostStats: hosts,
+		QueueSize:   queueSize,
+		Active:      active,
+		Crawling:    active > 0 || queueSize > 0,
+		Visited:     visited,
+		Documents:   e.Indexer.DocCount(),
+		Terms:       e.Indexer.TermCount(),
+		Paused:      paused,
+		HostStats:   hosts,
+		Retrying:    retrying,
+		RetryBudget: retryBudget,
+		RetryQueues: retryQueues,
+		Retries:     retries,
 	}
 }
 
@@ -836,11 +906,33 @@ func (e *Engine) parkRetry(ctx context.Context, item crawlItem, delay time.Durat
 		e.mu.Lock()
 		if e.queueGen != gen {
 			delete(e.pending, item.url)
+			host := hostOf(item.url)
+			if host != "" {
+				if e.hostRetries[host] > 0 {
+					e.hostRetries[host]--
+					if e.hostRetries[host] == 0 {
+						delete(e.hostRetries, host)
+					}
+				}
+			}
+			delete(e.retryAt, item.url)
+			delete(e.retryCounts, item.url)
 			e.mu.Unlock()
 			return
 		}
 		if !e.enqueue(item, 0) {
 			delete(e.pending, item.url)
+			host := hostOf(item.url)
+			if host != "" {
+				if e.hostRetries[host] > 0 {
+					e.hostRetries[host]--
+					if e.hostRetries[host] == 0 {
+						delete(e.hostRetries, host)
+					}
+				}
+			}
+			delete(e.retryAt, item.url)
+			delete(e.retryCounts, item.url)
 		}
 		e.mu.Unlock()
 	}()
@@ -896,13 +988,36 @@ func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 		return
 	}
 
+	host := hostOf(rawURL)
 	e.mu.Lock()
+	if e.retryBudget > 0 && host != "" {
+		if e.hostRetries[host] >= e.retryBudget {
+			// One unreachable site cannot keep the frontier busy.
+			delete(e.retryAt, rawURL)
+			delete(e.retryCounts, rawURL)
+			e.visited[rawURL] = struct{}{}
+			e.mu.Unlock()
+			if e.Store != nil {
+				e.Store.MarkVisited(rawURL)
+			}
+			return
+		}
+	}
 	attempt := e.retryCounts[rawURL] + 1
 	e.retryCounts[rawURL] = attempt
 	if attempt > maxRetries {
 		// The retry budget is spent, so the URL counts as visited and is
 		// not picked up again.
+		if host != "" {
+			if e.hostRetries[host] > 0 {
+				e.hostRetries[host]--
+				if e.hostRetries[host] == 0 {
+					delete(e.hostRetries, host)
+				}
+			}
+		}
 		delete(e.retryAt, rawURL)
+		delete(e.retryCounts, rawURL)
 		e.visited[rawURL] = struct{}{}
 		e.mu.Unlock()
 		if e.Store != nil {
@@ -915,6 +1030,9 @@ func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 	// The URL is marked pending so another page that links to it does not
 	// queue a second copy while the retry is waiting.
 	e.pending[rawURL] = struct{}{}
+	if host != "" {
+		e.hostRetries[host]++
+	}
 	e.mu.Unlock()
 
 	if e.Store != nil {
@@ -924,6 +1042,16 @@ func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 	if !e.enqueue(crawlItem{url: rawURL, depth: depth}, 0) {
 		e.mu.Lock()
 		delete(e.pending, rawURL)
+		if host != "" {
+			if e.hostRetries[host] > 0 {
+				e.hostRetries[host]--
+				if e.hostRetries[host] == 0 {
+					delete(e.hostRetries, host)
+				}
+			}
+		}
+		delete(e.retryAt, rawURL)
+		delete(e.retryCounts, rawURL)
 		e.mu.Unlock()
 	}
 }
@@ -933,8 +1061,17 @@ func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 // a URL that keeps failing runs out of attempts instead of being retried
 // forever.
 func (e *Engine) markDequeued(item crawlItem) {
+	host := hostOf(item.url)
 	e.mu.Lock()
 	delete(e.pending, item.url)
+	if host != "" {
+		if e.hostRetries[host] > 0 {
+			e.hostRetries[host]--
+			if e.hostRetries[host] == 0 {
+				delete(e.hostRetries, host)
+			}
+		}
+	}
 	_, known := e.visited[item.url]
 	if !known {
 		e.visited[item.url] = struct{}{}
@@ -961,7 +1098,16 @@ func (e *Engine) processURL(ctx context.Context, item crawlItem) {
 		return
 	}
 	e.recordHostStats(rawURL, true, nil)
+	host := hostOf(rawURL)
 	e.mu.Lock()
+	if host != "" {
+		if e.hostRetries[host] > 0 {
+			e.hostRetries[host]--
+			if e.hostRetries[host] == 0 {
+				delete(e.hostRetries, host)
+			}
+		}
+	}
 	delete(e.retryCounts, rawURL)
 	delete(e.retryAt, rawURL)
 	e.mu.Unlock()
