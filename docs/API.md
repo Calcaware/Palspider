@@ -73,7 +73,17 @@ No parameters.
   "visited": 1289,
   "queueSize": 0,
   "active": 0,
-  "peers": 2
+  "paused": false,
+  "peers": 2,
+  "hostStats": {
+    "example.com": {
+      "requests": 12,
+      "successes": 11,
+      "failures": 1,
+      "lastError": "HTTP 404",
+      "lastSeen": "2026-10-28T08:12:05Z"
+    }
+  }
 }
 ```
 
@@ -86,7 +96,9 @@ Field meanings:
 | `visited` | int | URLs discovered so far (pending items move to visited when dequeued). |
 | `queueSize` | int | URLs currently waiting to be crawled. |
 | `active` | int | Workers currently processing a URL. |
+| `paused` | bool | Whether workers are paused. |
 | `peers` | int | Number of registered peers. |
+| `hostStats` | object | Optional per-host request counts, failures, last error, and last fetch time. |
 
 ### `GET /api/search`
 
@@ -286,12 +298,80 @@ Crawl queue snapshot. `GET /api/crawl` is an alias for `GET /crawl-status`.
 {
   "queueSize": 3,
   "active": 2,
+  "crawling": true,
   "visited": 120,
-  "documents": 105
+  "documents": 105,
+  "terms": 812,
+  "paused": false,
+  "retrying": 1,
+  "retryBudget": 32,
+  "hostStats": {
+    "example.com": {"requests": 8, "successes": 7, "failures": 1, "lastSeen": "2026-10-28T08:12:05Z"}
+  },
+  "retryQueues": {"example.com": 1},
+  "retries": [
+    {"url": "https://example.com/broken", "host": "example.com", "retryAt": "2026-10-28T09:12:05Z", "inSeconds": 3480}
+  ]
 }
 ```
 
+`queueSize` is the number of URLs waiting on the worker channel, `active` is
+the number of workers currently fetching, and `crawling` is true when either
+is non-zero. `retrying` counts the URLs parked on a retry window,
+`retryBudget` is the per-host cap (zero means unlimited), `retryQueues` maps a
+host to the number of retries it currently holds, and `retries` lists those
+parked URLs with their retry time. The retry fields are omitted when no URL is
+waiting on a retry.
+
 This is what the web UI polls every three seconds.
+
+### `GET /api/crawl/queue`
+
+Lists the URLs waiting in the crawl frontier, including links parked on a
+retry window and seeds that have not been fetched yet. The Frontier dialog in
+the web UI shows the same data.
+
+Query parameters:
+
+| Parameter | Default | Range | Meaning |
+|---|---|---|---|
+| `limit` | `100` | `1` to `1000` | Maximum items returned. Values above `1000` are clamped; non-numeric or less than `1` are `400` errors. |
+| `offset` | `0` | `>= 0` | Number of matching items to skip. Negative or non-numeric values are `400` errors. |
+| `host` | unset | any host name | Restricts the snapshot to a host and its subdomains, such as `example.com`. Unset means every host. |
+
+```json
+{
+  "queueSize": 2,
+  "total": 2,
+  "queued": 1,
+  "retrying": 1,
+  "offset": 0,
+  "limit": 100,
+  "hosts": {
+    "example.com": {"queued": 1, "retrying": 1}
+  },
+  "items": [
+    {"url": "https://example.com/next", "host": "example.com", "depth": 1, "status": "queued"},
+    {"url": "https://example.com/broken", "host": "example.com", "depth": 2, "status": "retrying", "retryAt": "2026-10-28T09:12:05Z", "inSeconds": 3480}
+  ]
+}
+```
+
+Items are sorted by host and then URL so paging is stable. `queueSize` is the
+number of URLs on the worker channel, `total` is the number of matching
+frontier entries (`queued` plus `retrying`), and `hosts` covers every matching
+host even when the returned page is smaller than the frontier. A `retrying`
+item also carries `retryAt` (RFC 3339) and `inSeconds`, which counts down to
+the retry and is omitted once the window has opened. Items that a worker is
+currently fetching are not listed.
+
+Pagination metadata is also reported in the response headers:
+`X-Palspider-Count`, `X-Palspider-Offset`, `X-Palspider-Limit`, and
+`X-Palspider-Total`.
+
+```sh
+curl 'http://localhost:3000/api/crawl/queue?host=example.com&limit=20'
+```
 
 ### `POST /api/crawl`
 

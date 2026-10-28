@@ -45,6 +45,10 @@ deduplicated by URL, and peer lists gossip automatically.
   example `search eng` -> `search engine`).
 - **Sitemap export** - `GET /sitemap.xml` streams every indexed URL as an XML
   sitemap, optionally scoped to one host and its subdomains with `?host=`.
+- **Crawl frontier inspector** - `GET /api/crawl/queue` returns the URLs
+  waiting to be fetched, with depth, host, queued or retrying state, retry
+  timing, and a per-host backlog. The Frontier dialog in the web UI shows the
+  same snapshot without leaving the page.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
   concurrently with a hard 2 s time budget, results merge deduplicated by URL,
   peer lists gossip on contact, and peers track last-seen status.
@@ -52,8 +56,9 @@ deduplicated by URL, and peer lists gossip automatically.
   stored in a single bbolt database and restored on boot. Each crawled page
   persists in one transaction.
 - **Web UI** - Bootstrap 5 dark/light theme, live crawl stats, seed-URL
-  dialog, peer management, paginated results (10 per page, 100 max), 404 page.
-  Templates and assets are embedded in the binary (`embed.FS`).
+  dialog, frontier inspector, peer management, paginated results (10 per page,
+  100 max), 404 page. Templates and assets are embedded in the binary
+  (`embed.FS`).
 - **JSON API** - health, status, search (with offset paging), export, crawl,
   suggest, peers, and gossip endpoints for scripting. Read-only endpoints are
   cross-origin readable; mutations are protected by optional basic auth.
@@ -259,6 +264,7 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `GET /api/search?q=...&limit=10&offset=0&remote=0` | Search results. `limit` clamps to [1, 100], `offset` must be < 100, `remote=1` fans out to peers. Always returns an array. |
 | `GET /api/export?limit=100&offset=0&format=json` | Paginated export of indexed documents (`id`, `url`, `title`, `text`, `linkCount`). `limit` clamps to [1, 1000]; `format=ndjson` streams one document per line. |
 | `GET /api/crawl` | Alias of `GET /crawl-status`. |
+| `GET /api/crawl/queue?limit=100&offset=0&host=example.com` | Frontier snapshot: queued and retrying URLs with depth, host backlog, and retry timing. `limit` clamps to [1, 1000]; `host` matches subdomains too. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
 | `POST /api/crawl/pause` | Stop the workers from picking up new URLs. |
 | `POST /api/crawl/resume` | Let the workers pick up URLs again. |

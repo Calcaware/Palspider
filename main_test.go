@@ -116,6 +116,9 @@ func TestHomePage(t *testing.T) {
 	if !strings.Contains(body, "Palspider") {
 		t.Error("GET / body missing app name")
 	}
+	if !strings.Contains(body, "Crawl frontier") {
+		t.Error("GET / body missing the crawl frontier dialog")
+	}
 }
 
 func TestNotFound(t *testing.T) {
@@ -522,6 +525,51 @@ func TestAPICrawl(t *testing.T) {
 	}
 	if _, ok := st["queueSize"]; !ok {
 		t.Errorf("GET /api/crawl missing queueSize: %s", body)
+	}
+}
+
+func TestAPICrawlQueue(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Pause()
+	e.Seed("https://example.com/a")
+	e.Seed("https://other.example.org/b")
+
+	resp := getResp(t, ts.URL+"/api/crawl/queue?limit=1")
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("GET /api/crawl/queue status = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("X-Palspider-Total"); got != "2" {
+		t.Errorf("X-Palspider-Total = %q, want 2", got)
+	}
+	if got := resp.Header.Get("X-Palspider-Count"); got != "1" {
+		t.Errorf("X-Palspider-Count = %q, want 1", got)
+	}
+	var snap engine.QueueSnapshot
+	decodeJSON(t, resp, &snap)
+	if snap.Total != 2 || snap.Queued != 2 || snap.Retrying != 0 || len(snap.Items) != 1 {
+		t.Fatalf("queue snapshot = %+v, want 2 queued and one item on the page", snap)
+	}
+	if snap.Items[0].Host != "example.com" {
+		t.Errorf("first item host = %q, want example.com", snap.Items[0].Host)
+	}
+	if snap.Hosts["example.com"].Queued != 1 || snap.Hosts["other.example.org"].Queued != 1 {
+		t.Errorf("host backlog = %+v, want one queued URL per host", snap.Hosts)
+	}
+
+	resp = getResp(t, ts.URL+"/api/crawl/queue?host=example.com")
+	decodeJSON(t, resp, &snap)
+	if snap.Total != 1 || len(snap.Items) != 1 || snap.Items[0].Host != "example.com" {
+		t.Errorf("host filter snapshot = %+v, want only example.com", snap)
+	}
+
+	for _, query := range []string{"limit=0", "limit=abc", "offset=-1", "offset=abc"} {
+		code, _, body := get(t, ts.URL+"/api/crawl/queue?"+query)
+		if code != http.StatusBadRequest {
+			t.Errorf("GET /api/crawl/queue?%s = %d %q, want 400", query, code, body)
+		}
 	}
 }
 

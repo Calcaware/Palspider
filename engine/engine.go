@@ -111,7 +111,7 @@ type Engine struct {
 	urlChan     chan crawlItem
 	visited     map[string]struct{}
 	fpSeen      map[string]struct{}
-	pending     map[string]struct{}
+	pending     map[string]int
 	retryCounts map[string]int
 	retryAt     map[string]time.Time
 	hostRetries map[string]int
@@ -149,6 +149,38 @@ type RetryStatus struct {
 	Host   string `json:"host"`
 	RetryAt string `json:"retryAt"`
 	In     int64  `json:"inSeconds"`
+}
+
+// QueueItem is one URL waiting in the crawl frontier. Status is "queued"
+// while the URL sits on the worker channel and "retrying" while it waits for
+// its retry window to open.
+type QueueItem struct {
+	URL     string `json:"url"`
+	Host    string `json:"host"`
+	Depth   int    `json:"depth"`
+	Status  string `json:"status"`
+	RetryAt string `json:"retryAt,omitempty"`
+	In      int64  `json:"inSeconds,omitempty"`
+}
+
+// QueueHost counts the frontier entries for one host.
+type QueueHost struct {
+	Queued   int `json:"queued"`
+	Retrying int `json:"retrying"`
+}
+
+// QueueSnapshot is a point in time view of the crawl frontier. Hosts covers
+// every host in the filtered snapshot, including entries outside the returned
+// page, so callers can see the backlog without reading every item.
+type QueueSnapshot struct {
+	QueueSize int                  `json:"queueSize"`
+	Total     int                  `json:"total"`
+	Queued    int                  `json:"queued"`
+	Retrying  int                  `json:"retrying"`
+	Offset    int                  `json:"offset"`
+	Limit     int                  `json:"limit"`
+	Hosts     map[string]QueueHost `json:"hosts"`
+	Items     []QueueItem          `json:"items"`
 }
 
 type CrawlStatus struct {
@@ -192,7 +224,7 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 		urlChan:     make(chan crawlItem, 100000),
 		visited:     make(map[string]struct{}),
 		fpSeen:      make(map[string]struct{}),
-		pending:     make(map[string]struct{}),
+		pending:     make(map[string]int),
 		retryCounts: make(map[string]int),
 		retryAt:     make(map[string]time.Time),
 		hostRetries: make(map[string]int),
@@ -335,6 +367,7 @@ func (e *Engine) Seed(rawURL string) {
 		return
 	}
 	e.visited[normalized] = struct{}{}
+	e.pending[normalized] = 0
 	e.mu.Unlock()
 
 	if e.Store != nil {
@@ -343,6 +376,9 @@ func (e *Engine) Seed(rawURL string) {
 
 	if !e.enqueue(crawlItem{url: normalized, depth: 0}, 5*time.Second) {
 		e.forgetVisited(normalized)
+		e.mu.Lock()
+		delete(e.pending, normalized)
+		e.mu.Unlock()
 	}
 }
 
@@ -681,15 +717,26 @@ func (e *Engine) ClearQueue() {
 func (e *Engine) Requeue(rawURL string) bool {
 	normalized := crawler.NormalizeURL(rawURL)
 	e.mu.Lock()
-	delete(e.retryAt, normalized)
+	if _, retrying := e.retryAt[normalized]; retrying {
+		delete(e.retryAt, normalized)
+		e.releaseHostRetryLocked(normalized)
+	}
 	delete(e.retryCounts, normalized)
 	delete(e.pending, normalized)
 	delete(e.visited, normalized)
+	e.pending[normalized] = 0
+	e.mu.Unlock()
+
 	if e.Store != nil {
 		e.Store.DeleteVisited(normalized)
 	}
-	e.mu.Unlock()
-	return e.enqueue(crawlItem{url: normalized, depth: 0}, 5*time.Second)
+	if !e.enqueue(crawlItem{url: normalized, depth: 0}, 5*time.Second) {
+		e.mu.Lock()
+		delete(e.pending, normalized)
+		e.mu.Unlock()
+		return false
+	}
+	return true
 }
 
 func (e *Engine) Pause() {
@@ -845,6 +892,76 @@ func (e *Engine) CrawlStatus() CrawlStatus {
 	}
 }
 
+// QueueSnapshot returns the URLs waiting in the frontier, including those
+// parked on a retry window. host limits the result to one host and its
+// subdomains. offset and limit page through the sorted items; limit <= 0
+// returns every matching item. Hosts and totals describe all matching items,
+// not just the returned page.
+func (e *Engine) QueueSnapshot(host string, offset, limit int) QueueSnapshot {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), ".")
+	if offset < 0 {
+		offset = 0
+	}
+
+	e.mu.Lock()
+	items := make([]QueueItem, 0, len(e.pending))
+	hosts := make(map[string]QueueHost)
+	queued, retrying := 0, 0
+	for rawURL, depth := range e.pending {
+		if !hostMatchesURL(rawURL, host) {
+			continue
+		}
+		item := QueueItem{
+			URL:    rawURL,
+			Host:   hostOf(rawURL),
+			Depth:  depth,
+			Status: "queued",
+		}
+		entry := hosts[item.Host]
+		if at, ok := e.retryAt[rawURL]; ok {
+			item.Status = "retrying"
+			item.RetryAt = at.Format(time.RFC3339)
+			item.In = int64(time.Until(at).Seconds())
+			if item.In < 0 {
+				item.In = 0
+			}
+			entry.Retrying++
+			retrying++
+		} else {
+			entry.Queued++
+			queued++
+		}
+		hosts[item.Host] = entry
+		items = append(items, item)
+	}
+	e.mu.Unlock()
+
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Host != items[j].Host {
+			return items[i].Host < items[j].Host
+		}
+		return items[i].URL < items[j].URL
+	})
+	total := len(items)
+	if offset > total {
+		offset = total
+	}
+	items = items[offset:]
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return QueueSnapshot{
+		QueueSize: len(e.urlChan),
+		Total:     total,
+		Queued:    queued,
+		Retrying:  retrying,
+		Offset:    offset,
+		Limit:     limit,
+		Hosts:     hosts,
+		Items:     items,
+	}
+}
+
 func (e *Engine) monitorQueue(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -884,6 +1001,22 @@ func (e *Engine) worker(ctx context.Context) {
 	}
 }
 
+// releaseHostRetryLocked frees one retry slot for the host of rawURL.
+// Callers must hold e.mu. A slot is held only while that URL waits on its
+// retry, so dequeuing an unrelated page from the same host must not free it.
+func (e *Engine) releaseHostRetryLocked(rawURL string) {
+	host := hostOf(rawURL)
+	if host == "" {
+		return
+	}
+	if e.hostRetries[host] > 0 {
+		e.hostRetries[host]--
+		if e.hostRetries[host] == 0 {
+			delete(e.hostRetries, host)
+		}
+	}
+}
+
 // parkRetry holds a URL until its retry window opens and then puts it back
 // on the queue. The wait ends early when the engine stops, and a queue that
 // is cleared in the meantime drops the URL instead of restoring it.
@@ -904,35 +1037,11 @@ func (e *Engine) parkRetry(ctx context.Context, item crawlItem, delay time.Durat
 		// clear either happens before this check or after the push, never
 		// in between.
 		e.mu.Lock()
-		if e.queueGen != gen {
+		if e.queueGen != gen || !e.enqueue(item, 0) {
 			delete(e.pending, item.url)
-			host := hostOf(item.url)
-			if host != "" {
-				if e.hostRetries[host] > 0 {
-					e.hostRetries[host]--
-					if e.hostRetries[host] == 0 {
-						delete(e.hostRetries, host)
-					}
-				}
-			}
 			delete(e.retryAt, item.url)
 			delete(e.retryCounts, item.url)
-			e.mu.Unlock()
-			return
-		}
-		if !e.enqueue(item, 0) {
-			delete(e.pending, item.url)
-			host := hostOf(item.url)
-			if host != "" {
-				if e.hostRetries[host] > 0 {
-					e.hostRetries[host]--
-					if e.hostRetries[host] == 0 {
-						delete(e.hostRetries, host)
-					}
-				}
-			}
-			delete(e.retryAt, item.url)
-			delete(e.retryCounts, item.url)
+			e.releaseHostRetryLocked(item.url)
 		}
 		e.mu.Unlock()
 	}()
@@ -985,16 +1094,28 @@ func (e *Engine) retryBackoff(attempt int) time.Duration {
 // once the retry budget is spent.
 func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 	if err == nil || crawler.IsPermanent(err) {
+		// A permanent failure is not retried, so drop any retry bookkeeping
+		// the URL still carries instead of leaving it in the retry status.
+		e.mu.Lock()
+		if _, retrying := e.retryAt[rawURL]; retrying {
+			delete(e.retryAt, rawURL)
+			e.releaseHostRetryLocked(rawURL)
+		}
+		delete(e.retryCounts, rawURL)
+		delete(e.pending, rawURL)
+		e.mu.Unlock()
 		return
 	}
 
 	host := hostOf(rawURL)
 	e.mu.Lock()
-	if e.retryBudget > 0 && host != "" {
+	_, alreadyRetrying := e.retryAt[rawURL]
+	if e.retryBudget > 0 && host != "" && !alreadyRetrying {
 		if e.hostRetries[host] >= e.retryBudget {
 			// One unreachable site cannot keep the frontier busy.
 			delete(e.retryAt, rawURL)
 			delete(e.retryCounts, rawURL)
+			delete(e.pending, rawURL)
 			e.visited[rawURL] = struct{}{}
 			e.mu.Unlock()
 			if e.Store != nil {
@@ -1008,16 +1129,12 @@ func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 	if attempt > maxRetries {
 		// The retry budget is spent, so the URL counts as visited and is
 		// not picked up again.
-		if host != "" {
-			if e.hostRetries[host] > 0 {
-				e.hostRetries[host]--
-				if e.hostRetries[host] == 0 {
-					delete(e.hostRetries, host)
-				}
-			}
+		if _, retrying := e.retryAt[rawURL]; retrying {
+			delete(e.retryAt, rawURL)
+			e.releaseHostRetryLocked(rawURL)
 		}
-		delete(e.retryAt, rawURL)
 		delete(e.retryCounts, rawURL)
+		delete(e.pending, rawURL)
 		e.visited[rawURL] = struct{}{}
 		e.mu.Unlock()
 		if e.Store != nil {
@@ -1029,8 +1146,8 @@ func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 	delete(e.visited, rawURL)
 	// The URL is marked pending so another page that links to it does not
 	// queue a second copy while the retry is waiting.
-	e.pending[rawURL] = struct{}{}
-	if host != "" {
+	e.pending[rawURL] = depth
+	if host != "" && !alreadyRetrying {
 		e.hostRetries[host]++
 	}
 	e.mu.Unlock()
@@ -1042,35 +1159,24 @@ func (e *Engine) scheduleRetry(rawURL string, depth int, err error) {
 	if !e.enqueue(crawlItem{url: rawURL, depth: depth}, 0) {
 		e.mu.Lock()
 		delete(e.pending, rawURL)
-		if host != "" {
-			if e.hostRetries[host] > 0 {
-				e.hostRetries[host]--
-				if e.hostRetries[host] == 0 {
-					delete(e.hostRetries, host)
-				}
-			}
-		}
 		delete(e.retryAt, rawURL)
 		delete(e.retryCounts, rawURL)
+		e.releaseHostRetryLocked(rawURL)
 		e.mu.Unlock()
 	}
 }
 
 // markDequeued moves a URL from pending to visited so the "discovered" stat
-// reflects everything the crawler has picked up. The retry count is kept so
-// a URL that keeps failing runs out of attempts instead of being retried
-// forever.
+// reflects everything the crawler has picked up. When the URL was waiting on
+// a retry, the attempt consumes its per-host retry slot. The retry count is
+// kept so a URL that keeps failing runs out of attempts instead of being
+// retried forever.
 func (e *Engine) markDequeued(item crawlItem) {
-	host := hostOf(item.url)
 	e.mu.Lock()
 	delete(e.pending, item.url)
-	if host != "" {
-		if e.hostRetries[host] > 0 {
-			e.hostRetries[host]--
-			if e.hostRetries[host] == 0 {
-				delete(e.hostRetries, host)
-			}
-		}
+	if _, retrying := e.retryAt[item.url]; retrying {
+		delete(e.retryAt, item.url)
+		e.releaseHostRetryLocked(item.url)
 	}
 	_, known := e.visited[item.url]
 	if !known {
@@ -1098,16 +1204,9 @@ func (e *Engine) processURL(ctx context.Context, item crawlItem) {
 		return
 	}
 	e.recordHostStats(rawURL, true, nil)
-	host := hostOf(rawURL)
 	e.mu.Lock()
-	if host != "" {
-		if e.hostRetries[host] > 0 {
-			e.hostRetries[host]--
-			if e.hostRetries[host] == 0 {
-				delete(e.hostRetries, host)
-			}
-		}
-	}
+	// The retry slot, if any, was released when the worker dequeued this
+	// URL, so only the attempt counter needs clearing here.
 	delete(e.retryCounts, rawURL)
 	delete(e.retryAt, rawURL)
 	e.mu.Unlock()
@@ -1196,7 +1295,7 @@ func (e *Engine) discover(rawURL, html string, depth int) (map[string]int, []cra
 			e.mu.Unlock()
 			continue
 		}
-		e.pending[normalized] = struct{}{}
+		e.pending[normalized] = childDepth
 		e.mu.Unlock()
 
 		toEnqueue = append(toEnqueue, crawlItem{url: normalized, depth: childDepth})

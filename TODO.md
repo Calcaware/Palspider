@@ -19,6 +19,7 @@ Tasks:
 - [x] Add jitter to the retry backoff so a group of workers does not hit a recovered host all at once.
 - [x] Add a per-host retry budget so one unreachable site cannot keep the frontier busy.
 - [x] Report the URLs that are waiting on a retry window in the crawl status, so operators can see what the frontier is holding.
+- [x] Release a per-host retry slot only when its own URL leaves the retry window, so unrelated pages from the same host do not free it.
 
 Why:
 - Right now, the crawler marks a URL as visited when it is dequeued, even before the fetch succeeds. That makes the system efficient, but it reduces recoverability when a page fails for temporary reasons.
@@ -113,7 +114,8 @@ Tasks:
 
 ### 3.2 Crawl management features
 
-- [ ] Add a crawl queue inspector.
+- [x] Add a crawl queue inspector.
+- [ ] Let the queue inspector drop or prioritize a single URL.
 - [ ] Add pause/resume/restart controls for the crawler.
 - [ ] Add per-domain crawl budgets and priority scheduling.
 - [ ] Add domain-level status and queue backlog display.

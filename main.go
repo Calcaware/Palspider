@@ -140,6 +140,7 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("GET /api/related", handleAPIRelated(e))
 	mux.HandleFunc("GET /api/export", handleAPIExport(e))
 	mux.HandleFunc("GET /api/crawl", handleCrawlStatus(e))
+	mux.HandleFunc("GET /api/crawl/queue", handleAPICrawlQueue(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
 	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
 	mux.HandleFunc("POST /api/crawl/resume", handleAPICrawlResume(e))
@@ -632,6 +633,44 @@ func handleAPICrawl(e *engine.Engine) http.HandlerFunc {
 func handleCrawlStatus(e *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, e.CrawlStatus())
+	}
+}
+
+// handleAPICrawlQueue lists the URLs waiting in the frontier, including the
+// ones parked on a retry window. limit defaults to 100 and clamps to
+// [1, 1000], offset must be >= 0, and host optionally narrows the snapshot to
+// one host and its subdomains.
+func handleAPICrawlQueue(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		limit := 100
+		if l := r.URL.Query().Get("limit"); l != "" {
+			v, err := strconv.Atoi(l)
+			if err != nil || v < 1 {
+				writeJSONError(w, http.StatusBadRequest, "limit must be an integer >= 1")
+				return
+			}
+			if v > 1000 {
+				v = 1000
+			}
+			limit = v
+		}
+		offset := 0
+		if o := r.URL.Query().Get("offset"); o != "" {
+			v, err := strconv.Atoi(o)
+			if err != nil || v < 0 {
+				writeJSONError(w, http.StatusBadRequest, "offset must be an integer >= 0")
+				return
+			}
+			offset = v
+		}
+		host := strings.TrimSpace(r.URL.Query().Get("host"))
+
+		snapshot := e.QueueSnapshot(host, offset, limit)
+		w.Header().Set("X-Palspider-Count", strconv.Itoa(len(snapshot.Items)))
+		w.Header().Set("X-Palspider-Offset", strconv.Itoa(snapshot.Offset))
+		w.Header().Set("X-Palspider-Limit", strconv.Itoa(snapshot.Limit))
+		w.Header().Set("X-Palspider-Total", strconv.Itoa(snapshot.Total))
+		writeJSON(w, http.StatusOK, snapshot)
 	}
 }
 

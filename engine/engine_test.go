@@ -52,6 +52,126 @@ func TestMergeResultsLimit(t *testing.T) {
 	}
 }
 
+func TestQueueSnapshotListsQueuedAndRetryingItems(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/seed")
+	e.Seed("https://other.example.org/start")
+	retryURL := "https://example.com/broken"
+	e.scheduleRetry(retryURL, 2, errors.New("temporary network failure"))
+
+	snap := e.QueueSnapshot("", 0, 0)
+	if snap.Total != 3 || snap.Queued != 2 || snap.Retrying != 1 {
+		t.Fatalf("snapshot counts = total %d queued %d retrying %d, want 3/2/1",
+			snap.Total, snap.Queued, snap.Retrying)
+	}
+	if snap.QueueSize != 3 {
+		t.Errorf("queueSize = %d, want 3", snap.QueueSize)
+	}
+	if len(snap.Items) != 3 {
+		t.Fatalf("items = %d, want 3", len(snap.Items))
+	}
+	// Items are grouped by host and sorted by URL within a host.
+	if snap.Items[0].URL != retryURL || snap.Items[0].Status != "retrying" {
+		t.Errorf("first item = %+v, want the retrying example.com URL", snap.Items[0])
+	}
+	if snap.Items[0].Depth != 2 || snap.Items[0].RetryAt == "" {
+		t.Errorf("retry item = %+v, want depth 2 and a retry timestamp", snap.Items[0])
+	}
+	host := snap.Hosts["example.com"]
+	if host.Queued != 1 || host.Retrying != 1 {
+		t.Errorf("example.com backlog = %+v, want 1 queued and 1 retrying", host)
+	}
+
+	page := e.QueueSnapshot("example.com", 1, 1)
+	if page.Total != 2 || len(page.Items) != 1 {
+		t.Fatalf("filtered page = total %d items %d, want 2/1", page.Total, len(page.Items))
+	}
+	if page.Items[0].URL != "https://example.com/seed" {
+		t.Errorf("filtered page item = %q, want the queued seed", page.Items[0].URL)
+	}
+	if page.Queued != 1 || page.Retrying != 1 {
+		t.Errorf("filtered totals = queued %d retrying %d, want 1/1", page.Queued, page.Retrying)
+	}
+}
+
+func TestQueueSnapshotDropsEntriesWhenTheyAreDequeued(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/page")
+
+	item := <-e.urlChan
+	e.markDequeued(item)
+
+	snap := e.QueueSnapshot("", 0, 0)
+	if snap.Total != 0 || len(snap.Items) != 0 {
+		t.Errorf("snapshot after dequeue = %+v, want an empty frontier", snap)
+	}
+	if snap.QueueSize != 0 {
+		t.Errorf("queueSize after dequeue = %d, want 0", snap.QueueSize)
+	}
+}
+
+func TestDequeueingAPageKeepsOtherRetrySlots(t *testing.T) {
+	e := New(2, 10, 0, nil)
+	retryURL := "https://example.com/broken"
+	e.scheduleRetry(retryURL, 0, errors.New("temporary network failure"))
+
+	// Crawling another page from the same host must not free the slot that
+	// the retrying URL still holds.
+	e.markDequeued(crawlItem{url: "https://example.com/page", depth: 1})
+	e.mu.Lock()
+	slots := e.hostRetries["example.com"]
+	e.mu.Unlock()
+	if slots != 1 {
+		t.Fatalf("host retry slots = %d, want the retrying URL to keep its slot", slots)
+	}
+
+	item := <-e.urlChan
+	e.markDequeued(item)
+	e.mu.Lock()
+	slots = e.hostRetries["example.com"]
+	_, retrying := e.retryAt[retryURL]
+	e.mu.Unlock()
+	if slots != 0 || retrying {
+		t.Errorf("after the retry attempt: slots %d, retrying %v, want 0 and false", slots, retrying)
+	}
+}
+
+func TestRequeueReleasesRetrySlot(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/broken"
+	e.scheduleRetry(rawURL, 0, errors.New("temporary network failure"))
+
+	if !e.Requeue(rawURL) {
+		t.Fatal("Requeue returned false")
+	}
+	e.mu.Lock()
+	slots := e.hostRetries["example.com"]
+	_, retrying := e.retryAt[rawURL]
+	_, counted := e.retryCounts[rawURL]
+	e.mu.Unlock()
+	if slots != 0 || retrying || counted {
+		t.Errorf("after requeue: slots %d retrying %v counted %v, want 0 false false", slots, retrying, counted)
+	}
+}
+
+func TestPermanentFailureClearsRetryStatus(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/gone"
+	e.scheduleRetry(rawURL, 0, errors.New("temporary network failure"))
+
+	e.scheduleRetry(rawURL, 0, fmt.Errorf("%w: path %q", crawler.ErrExcluded, "/gone"))
+
+	e.mu.Lock()
+	slots := e.hostRetries["example.com"]
+	_, retrying := e.retryAt[rawURL]
+	_, counted := e.retryCounts[rawURL]
+	e.mu.Unlock()
+	if slots != 0 || retrying || counted {
+		t.Errorf("after a permanent failure: slots %d retrying %v counted %v, want all cleared",
+			slots, retrying, counted)
+	}
+}
+
 func TestAddDocumentMarksVisitedAndDedupes(t *testing.T) {
 	e := New(1, 10, 0, nil)
 
@@ -104,7 +224,7 @@ func TestEnqueueAllRollsBackPendingWhenQueueFull(t *testing.T) {
 
 	const target = "https://example.com/full"
 	e.mu.Lock()
-	e.pending[target] = struct{}{}
+	e.pending[target] = 1
 	e.mu.Unlock()
 
 	e.enqueueAll(context.Background(), []crawlItem{{url: target, depth: 1}})

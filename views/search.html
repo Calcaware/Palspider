@@ -24,6 +24,9 @@
         <button class="btn btn-sm btn-outline-secondary border-0 fs-5 ms-1" data-bs-toggle="modal" data-bs-target="#settingsModal" title="Settings">
           <i class="bi bi-gear"></i>
         </button>
+        <button class="btn btn-sm btn-outline-secondary border-0 fs-5 ms-1" data-bs-toggle="modal" data-bs-target="#frontierModal" title="Crawl frontier">
+          <i class="bi bi-list-ul"></i>
+        </button>
       </div>
     </div>
   </div>
@@ -89,6 +92,23 @@
             </div>
             <button class="btn btn-primary w-100" type="submit">Crawl</button>
           </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="modal fade" id="frontierModal" tabindex="-1">
+    <div class="modal-dialog modal-dialog-centered modal-lg modal-dialog-scrollable">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">Crawl frontier</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="small text-secondary mb-2" id="frontierSummary">Loading...</p>
+          <div id="frontierHosts" class="mb-3"></div>
+          <ul id="frontierItems" class="list-group list-group-flush small"></ul>
+          <p id="frontierEmpty" class="text-secondary small mb-0 d-none">The frontier is empty.</p>
         </div>
       </div>
     </div>
@@ -264,6 +284,53 @@
     });
 
     document.getElementById('settingsModal').addEventListener('shown.bs.modal', loadPeers);
+
+    const frontierModal = document.getElementById('frontierModal');
+    const frontierSummary = document.getElementById('frontierSummary');
+    const frontierHosts = document.getElementById('frontierHosts');
+    const frontierItems = document.getElementById('frontierItems');
+    const frontierEmpty = document.getElementById('frontierEmpty');
+
+    async function loadFrontier() {
+      try {
+        const res = await fetch('/api/crawl/queue?limit=25');
+        const data = await res.json();
+        frontierSummary.textContent =
+          data.queued + ' queued, ' + data.retrying + ' retrying, ' + data.total + ' total';
+
+        frontierHosts.textContent = '';
+        const hosts = Object.entries(data.hosts || {})
+          .sort((a, b) => (b[1].queued + b[1].retrying) - (a[1].queued + a[1].retrying))
+          .slice(0, 6);
+        hosts.forEach(([host, counts]) => {
+          const badge = document.createElement('span');
+          badge.className = 'badge text-bg-secondary me-1 mb-1';
+          badge.textContent = host + ': ' + counts.queued + ' queued' +
+            (counts.retrying ? ', ' + counts.retrying + ' retrying' : '');
+          frontierHosts.appendChild(badge);
+        });
+
+        frontierItems.textContent = '';
+        (data.items || []).forEach(item => {
+          const li = document.createElement('li');
+          li.className = 'list-group-item px-0 py-1';
+          const link = document.createElement('div');
+          link.className = 'text-break';
+          link.textContent = item.url;
+          const meta = document.createElement('div');
+          meta.className = 'text-secondary';
+          meta.textContent = 'depth ' + item.depth + ', ' + item.status +
+            (item.status === 'retrying' && item.inSeconds ? ', retry in ' + item.inSeconds + 's' : '');
+          li.append(link, meta);
+          frontierItems.appendChild(li);
+        });
+        frontierEmpty.classList.toggle('d-none', (data.total || 0) > 0);
+      } catch (e) {
+        frontierSummary.textContent = 'Could not load the crawl frontier.';
+      }
+    }
+
+    frontierModal.addEventListener('shown.bs.modal', loadFrontier);
 
     async function pollStats() {
       try {
