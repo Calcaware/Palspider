@@ -35,7 +35,8 @@ Tasks:
 - [x] Add per-host exclusion rules so one site's noisy routes can be skipped without changing the global list.
 - [x] Add configuration for max pages per host and max links per page.
 - [ ] Add a “stay in scope” policy for seeds and discovered links.
-- [ ] Persist per-host page counts so the per-host budget survives a restart instead of resetting to zero.
+- [x] Persist per-host page counts so the per-host budget survives a restart instead of resetting to zero.
+- [x] Rebuild per-host counts from indexed documents on restore to stay accurate after upgrades.
 - [x] Honor a site's `Crawl-delay` from robots.txt in the per-host rate limiter when it asks for a longer wait than the configured 200 ms.
 - [x] Document default behavior and override behavior in the README and API docs.
 

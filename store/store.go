@@ -19,7 +19,7 @@ func Open(path string) (*Store, error) {
 	}
 
 	err = db.Update(func(tx *bolt.Tx) error {
-		for _, name := range []string{"docs", "index", "links", "visited", "fingerprints", "meta"} {
+		for _, name := range []string{"docs", "index", "links", "visited", "fingerprints", "meta", "hostcounts"} {
 			if _, err := tx.CreateBucketIfNotExists([]byte(name)); err != nil {
 				return err
 			}
@@ -220,5 +220,37 @@ func itob(v int) []byte {
 }
 
 func btoi(b []byte) int {
+	if len(b) == 0 {
+		return 0
+	}
 	return int(binary.BigEndian.Uint64(b))
+}
+
+func (s *Store) SaveHostCount(host string, count int) error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("hostcounts")).Put([]byte(host), itob(count))
+	})
+}
+
+func (s *Store) SaveHostCounts(counts map[string]int) error {
+	if len(counts) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		b := tx.Bucket([]byte("hostcounts"))
+		for host, count := range counts {
+			if err := b.Put([]byte(host), itob(count)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) AllHostCounts(fn func(host string, count int) error) error {
+	return s.db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("hostcounts")).ForEach(func(k, v []byte) error {
+			return fn(string(k), btoi(v))
+		})
+	})
 }

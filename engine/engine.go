@@ -41,6 +41,11 @@ const (
 	// window in either direction. The spread keeps a group of workers from
 	// hitting a recovered host all at once.
 	retryJitterPercent = 10
+
+	// priorityQueueSize bounds the channel that carries URLs an operator
+	// asked the crawler to fetch next. It is small next to the main frontier
+	// because only interactive actions use it.
+	priorityQueueSize = 10000
 )
 
 // EnvRetryDelay names the variable that sets how long the crawler waits
@@ -109,6 +114,7 @@ type Engine struct {
 	retryWindow time.Duration
 	retryBudget int
 	urlChan     chan crawlItem
+	priorityChan chan crawlItem
 	visited     map[string]struct{}
 	fpSeen      map[string]struct{}
 	pending     map[string]int
@@ -222,6 +228,7 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 		retryWindow: retryWindowFromEnv(),
 		retryBudget: retryBudgetFromEnv(),
 		urlChan:     make(chan crawlItem, 100000),
+		priorityChan: make(chan crawlItem, priorityQueueSize),
 		visited:     make(map[string]struct{}),
 		fpSeen:      make(map[string]struct{}),
 		pending:     make(map[string]int),
@@ -289,6 +296,34 @@ func (e *Engine) Restore() error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// Rebuild host counts from restored documents to ensure accuracy
+	if e.maxPerHost > 0 {
+		// Clear and rebuild
+		for k := range e.hostDocs {
+			delete(e.hostDocs, k)
+		}
+		err = e.Store.AllDocuments(func(id int, data []byte) error {
+			var doc indexer.Document
+			if err := json.Unmarshal(data, &doc); err != nil {
+				return err
+			}
+			if h := hostOf(doc.URL); h != "" {
+				e.hostDocs[h]++
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		if err := e.Store.AllHostCounts(func(host string, count int) error {
+			e.hostDocs[host] = count
+			return nil
+		}); err != nil {
+			return err
+		}
 	}
 
 	nextID, err := e.Store.LoadNextDocID()
@@ -692,26 +727,82 @@ func (e *Engine) ClearQueue() {
 	e.mu.Unlock()
 
 	var dropped []string
-	for {
-		select {
-		case item := <-e.urlChan:
-			// A dropped URL is not visited any more, so it can be crawled
-			// again later.
-			e.mu.Lock()
-			delete(e.visited, item.url)
-			e.mu.Unlock()
-			dropped = append(dropped, item.url)
-			continue
-		default:
+	drain := func(ch chan crawlItem) {
+		for {
+			select {
+			case item := <-ch:
+				// A dropped URL is not visited any more, so it can be crawled
+				// again later.
+				e.mu.Lock()
+				delete(e.visited, item.url)
+				e.mu.Unlock()
+				dropped = append(dropped, item.url)
+			default:
+				return
+			}
 		}
-		break
 	}
+	drain(e.urlChan)
+	drain(e.priorityChan)
 	if e.Store != nil && len(dropped) > 0 {
 		if err := e.Store.DeleteVisitedBatch(dropped); err != nil {
 			log.Printf("clear queue: %v", err)
 		}
 	}
 	atomic.StoreInt32(&e.queueSize, 0)
+}
+
+// DropURL removes one URL from the crawl frontier and marks it visited, so
+// the same link is not queued again until Requeue resets it. A copy that is
+// already sitting in a worker channel is ignored when it is dequeued because
+// the URL is no longer pending.
+func (e *Engine) DropURL(rawURL string) bool {
+	normalized := crawler.NormalizeURL(rawURL)
+	e.mu.Lock()
+	if _, pending := e.pending[normalized]; !pending {
+		e.mu.Unlock()
+		return false
+	}
+	delete(e.pending, normalized)
+	delete(e.retryCounts, normalized)
+	if _, retrying := e.retryAt[normalized]; retrying {
+		delete(e.retryAt, normalized)
+		e.releaseHostRetryLocked(normalized)
+	}
+	e.visited[normalized] = struct{}{}
+	e.mu.Unlock()
+
+	if e.Store != nil {
+		e.Store.MarkVisited(normalized)
+	}
+	return true
+}
+
+// PrioritizeURL puts a queued URL at the front of the crawl order. Retrying
+// URLs are refused because their window is part of the host's politeness
+// budget; requeue them instead when the wait should be skipped. The ordinary
+// copy stays on the main queue and is discarded when it is dequeued, since
+// the first copy to claim the URL removes it from pending.
+func (e *Engine) PrioritizeURL(rawURL string) bool {
+	normalized := crawler.NormalizeURL(rawURL)
+	e.mu.Lock()
+	depth, pending := e.pending[normalized]
+	if !pending {
+		e.mu.Unlock()
+		return false
+	}
+	if _, retrying := e.retryAt[normalized]; retrying {
+		e.mu.Unlock()
+		return false
+	}
+	select {
+	case e.priorityChan <- crawlItem{url: normalized, depth: depth}:
+		e.mu.Unlock()
+		return true
+	default:
+		e.mu.Unlock()
+		return false
+	}
 }
 
 func (e *Engine) Requeue(rawURL string) bool {
@@ -777,9 +868,16 @@ func (e *Engine) countHostDoc(rawURL string) {
 	if host == "" {
 		return
 	}
+	var count int
 	e.mu.Lock()
 	e.hostDocs[host]++
+	count = e.hostDocs[host]
 	e.mu.Unlock()
+	if e.Store != nil {
+		if err := e.Store.SaveHostCount(host, count); err != nil {
+			log.Printf("persist host count: %v", err)
+		}
+	}
 }
 
 // hostHasBudget reports whether host still has room under the per-host page
@@ -951,7 +1049,7 @@ func (e *Engine) QueueSnapshot(host string, offset, limit int) QueueSnapshot {
 		items = items[:limit]
 	}
 	return QueueSnapshot{
-		QueueSize: len(e.urlChan),
+		QueueSize: len(e.urlChan) + len(e.priorityChan),
 		Total:     total,
 		Queued:    queued,
 		Retrying:  retrying,
@@ -970,7 +1068,7 @@ func (e *Engine) monitorQueue(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			atomic.StoreInt32(&e.queueSize, int32(len(e.urlChan)))
+			atomic.StoreInt32(&e.queueSize, int32(len(e.urlChan)+len(e.priorityChan)))
 		}
 	}
 }
@@ -979,26 +1077,73 @@ func (e *Engine) worker(ctx context.Context) {
 	defer e.wg.Done()
 
 	for {
+		// A URL an operator asked to prioritize is taken before the ordinary
+		// queue whenever a worker is free, so the frontier action has an
+		// effect straight away.
 		select {
 		case <-ctx.Done():
 			return
+		case item := <-e.priorityChan:
+			e.handleItem(ctx, item)
+			continue
+		default:
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-e.priorityChan:
+			e.handleItem(ctx, item)
 		case item := <-e.urlChan:
-			if e.Paused() {
-				if !e.enqueue(item, 5*time.Second) {
-					e.mu.Lock()
-					delete(e.pending, item.url)
-					e.mu.Unlock()
-				}
-				continue
-			}
-			if delay := e.retryDelay(item.url); delay > 0 {
-				e.parkRetry(ctx, item, delay)
-				continue
-			}
-			e.markDequeued(item)
-			e.processURL(ctx, item)
+			e.handleItem(ctx, item)
 		}
 	}
+}
+
+func (e *Engine) handleItem(ctx context.Context, item crawlItem) {
+	if e.Paused() {
+		if !e.enqueue(item, 5*time.Second) {
+			e.mu.Lock()
+			delete(e.pending, item.url)
+			e.mu.Unlock()
+		}
+		return
+	}
+	if delay := e.retryDelay(item.url); delay > 0 {
+		e.parkRetry(ctx, item, delay)
+		return
+	}
+	if !e.takeQueued(item) {
+		return
+	}
+	e.processURL(ctx, item)
+}
+
+// takeQueued claims the frontier entry for item and moves it from pending to
+// visited. It returns false for a stale copy, such as one that is still in a
+// channel after the URL was dropped or already fetched from a prioritized
+// copy, so the worker does not process the same URL twice.
+func (e *Engine) takeQueued(item crawlItem) bool {
+	e.mu.Lock()
+	if _, pending := e.pending[item.url]; !pending {
+		e.mu.Unlock()
+		return false
+	}
+	delete(e.pending, item.url)
+	if _, retrying := e.retryAt[item.url]; retrying {
+		delete(e.retryAt, item.url)
+		e.releaseHostRetryLocked(item.url)
+	}
+	_, known := e.visited[item.url]
+	if !known {
+		e.visited[item.url] = struct{}{}
+	}
+	e.mu.Unlock()
+
+	if !known && e.Store != nil {
+		e.Store.MarkVisited(item.url)
+	}
+	return true
 }
 
 // releaseHostRetryLocked frees one retry slot for the host of rawURL.
@@ -1037,7 +1182,8 @@ func (e *Engine) parkRetry(ctx context.Context, item crawlItem, delay time.Durat
 		// clear either happens before this check or after the push, never
 		// in between.
 		e.mu.Lock()
-		if e.queueGen != gen || !e.enqueue(item, 0) {
+		_, stillRetrying := e.retryAt[item.url]
+		if e.queueGen != gen || !stillRetrying || !e.enqueue(item, 0) {
 			delete(e.pending, item.url)
 			delete(e.retryAt, item.url)
 			delete(e.retryCounts, item.url)

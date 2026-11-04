@@ -98,7 +98,7 @@ Everything is configured through environment variables:
 | `PALSPIDER_WORKERS` | `50` | Number of crawler worker goroutines. |
 | `PALSPIDER_MAX_DEPTH` | `10` | Link hops from a seed. `-1` means unlimited. |
 | `PALSPIDER_MAX_PAGES` | `0` | Stop queueing new pages after this many documents. `0` means unlimited. |
-| `PALSPIDER_MAX_PAGES_PER_HOST` | `0` | Cap how many indexed pages one host may contribute. `0` means unlimited. Discovered links outside the budget are still counted for in-degree but not queued. |
+| `PALSPIDER_MAX_PAGES_PER_HOST` | `0` | Cap how many indexed pages one host may contribute. `0` means unlimited. Discovered links outside the budget are still counted for in-degree but not queued. Counts persist across restarts. |
 | `PALSPIDER_MAX_LINKS_PER_PAGE` | `0` | Follow at most this many links from a single page, taking the first ones in document order. `0` means unlimited. |
 | `PALSPIDER_DB` | `palspider.db` | Path to the bbolt database file. |
 | `PALSPIDER_ALLOW_PRIVATE` | unset | Set to `1` to allow crawling loopback and private-network hosts. |

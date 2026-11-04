@@ -446,7 +446,7 @@ Two further budgets shape the frontier without rejecting the seed itself.
 `PALSPIDER_MAX_LINKS_PER_PAGE` (default unset, meaning unlimited) caps how many
 links are followed from a single page, and `PALSPIDER_MAX_PAGES_PER_HOST`
 (default unset, meaning unlimited) caps how many indexed pages one host may
-contribute. Links outside either budget are still counted for in-degree but are
+contribute and persists across restarts. Links outside either budget are still counted for in-degree but are
 not queued. The full list of variables is in the README.
 
 ### `POST /api/crawl/pause` and `POST /api/crawl/resume`

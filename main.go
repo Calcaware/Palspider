@@ -141,6 +141,8 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("GET /api/export", handleAPIExport(e))
 	mux.HandleFunc("GET /api/crawl", handleCrawlStatus(e))
 	mux.HandleFunc("GET /api/crawl/queue", handleAPICrawlQueue(e))
+	mux.HandleFunc("POST /api/crawl/queue/drop", handleAPICrawlQueueDrop(e))
+	mux.HandleFunc("POST /api/crawl/queue/prioritize", handleAPICrawlQueuePrioritize(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
 	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
 	mux.HandleFunc("POST /api/crawl/resume", handleAPICrawlResume(e))
@@ -714,6 +716,50 @@ func handleAPICrawlRequeue(e *engine.Engine) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted", "url": crawler.NormalizeURL(body.URL)})
+	}
+}
+
+func handleAPICrawlQueueDrop(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if body.URL == "" {
+			writeJSONError(w, http.StatusBadRequest, "url required")
+			return
+		}
+		if !e.DropURL(body.URL) {
+			writeJSONError(w, http.StatusBadRequest, "url could not be dropped")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "dropped": true})
+	}
+}
+
+func handleAPICrawlQueuePrioritize(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		if body.URL == "" {
+			writeJSONError(w, http.StatusBadRequest, "url required")
+			return
+		}
+		if !e.PrioritizeURL(body.URL) {
+			writeJSONError(w, http.StatusBadRequest, "url could not be prioritized")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "prioritized": true})
 	}
 }
 
