@@ -116,7 +116,8 @@ Tasks:
 ### 3.2 Crawl management features
 
 - [x] Add a crawl queue inspector.
-- [ ] Let the queue inspector drop or prioritize a single URL.
+- [x] Let the queue inspector drop or prioritize a single URL.
+- [ ] Add bulk frontier actions so every queued or retrying URL for one host can be dropped or prioritized at once.
 - [ ] Add pause/resume/restart controls for the crawler.
 - [ ] Add per-domain crawl budgets and priority scheduling.
 - [ ] Add domain-level status and queue backlog display.

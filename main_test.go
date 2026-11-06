@@ -573,6 +573,71 @@ func TestAPICrawlQueue(t *testing.T) {
 	}
 }
 
+func TestAPICrawlQueueDropAndPrioritize(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Pause()
+	e.Seed("https://example.com/drop")
+	e.Seed("https://example.com/keep")
+
+	resp := postJSON(t, ts.URL+"/api/crawl/queue/drop", `{"url":"https://example.com/drop"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/drop status = %d, want 200", resp.StatusCode)
+	}
+	var dropped map[string]interface{}
+	decodeJSON(t, resp, &dropped)
+	if dropped["dropped"] != true {
+		t.Fatalf("drop response = %#v, want dropped=true", dropped)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/drop", `{"url":"https://example.com/drop"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("dropping the same URL twice = %d, want 400", resp.StatusCode)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/prioritize", `{"url":"https://example.com/keep"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/prioritize status = %d, want 200", resp.StatusCode)
+	}
+	var prioritized map[string]interface{}
+	decodeJSON(t, resp, &prioritized)
+	if prioritized["prioritized"] != true {
+		t.Fatalf("prioritize response = %#v, want prioritized=true", prioritized)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/prioritize", `{"url":"https://example.com/missing"}`)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("prioritizing a URL outside the frontier = %d, want 400", resp.StatusCode)
+	}
+
+	for _, action := range []string{"drop", "prioritize"} {
+		for _, body := range []string{`{not json`, `{}`} {
+			resp = postJSON(t, ts.URL+"/api/crawl/queue/"+action, body)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("POST /api/crawl/queue/%s %s = %d, want 400", action, body, resp.StatusCode)
+			}
+		}
+	}
+
+	code, _, body := get(t, ts.URL+"/api/crawl/queue")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/crawl/queue = %d, want 200", code)
+	}
+	var snap engine.QueueSnapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("queue snapshot: %v", err)
+	}
+	if snap.Total != 1 || len(snap.Items) != 1 || snap.Items[0].URL != "https://example.com/keep" {
+		t.Errorf("frontier after the actions = %+v, want only the kept URL", snap)
+	}
+}
+
 func TestAPICrawlAppliesExclusions(t *testing.T) {
 	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/search,/login")
 	ts, done := newTestServer(t)

@@ -48,7 +48,8 @@ deduplicated by URL, and peer lists gossip automatically.
 - **Crawl frontier inspector** - `GET /api/crawl/queue` returns the URLs
   waiting to be fetched, with depth, host, queued or retrying state, retry
   timing, and a per-host backlog. The Frontier dialog in the web UI shows the
-  same snapshot without leaving the page.
+  same snapshot without leaving the page, and each entry can be dropped or
+  moved to the front of the crawl order.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
   concurrently with a hard 2 s time budget, results merge deduplicated by URL,
   peer lists gossip on contact, and peers track last-seen status.
@@ -265,6 +266,8 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `GET /api/export?limit=100&offset=0&format=json` | Paginated export of indexed documents (`id`, `url`, `title`, `text`, `linkCount`). `limit` clamps to [1, 1000]; `format=ndjson` streams one document per line. |
 | `GET /api/crawl` | Alias of `GET /crawl-status`. |
 | `GET /api/crawl/queue?limit=100&offset=0&host=example.com` | Frontier snapshot: queued and retrying URLs with depth, host backlog, and retry timing. `limit` clamps to [1, 1000]; `host` matches subdomains too. |
+| `POST /api/crawl/queue/drop` | `{"url":"..."}` - remove one URL from the frontier and skip it. `POST /api/crawl/requeue` resets it. |
+| `POST /api/crawl/queue/prioritize` | `{"url":"..."}` - move a queued URL to the front of the crawl order. Retrying URLs are refused. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
 | `POST /api/crawl/pause` | Stop the workers from picking up new URLs. |
 | `POST /api/crawl/resume` | Let the workers pick up URLs again. |
@@ -310,11 +313,11 @@ go test -race ./... # same, with the race detector (needs CGO / gcc)
 
 The test suite covers URL normalization, crawl exclusions (global and per host),
 robots rule precedence and crawl-delay parsing, per-host and per-page crawl
-budgets, retry requeueing and backoff jitter, queue clearing, text and link
-extraction, tokenizing, rate limiting, the private-address guard, trie
-concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
-persistence, result merging, document export (JSON and streaming NDJSON), and peer
-URL handling.
+budgets, retry requeueing and backoff jitter, queue clearing, dropping and
+prioritizing a single frontier URL, text and link extraction, tokenizing, rate
+limiting, the private-address guard, trie concurrency, index bookkeeping, prefix
+lookups, ranking and suggestions, batch persistence, result merging, document
+export (JSON and streaming NDJSON), and peer URL handling.
 
 ## Known issues
 

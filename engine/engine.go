@@ -125,6 +125,7 @@ type Engine struct {
 	hostStats   map[string]HostStat
 	hostDocs    map[string]int
 	paused      bool
+	resumeCh    chan struct{}
 	mu          sync.Mutex
 	wg          sync.WaitGroup
 	active      int32
@@ -237,7 +238,11 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 		hostRetries: make(map[string]int),
 		hostStats:   make(map[string]HostStat),
 		hostDocs:    make(map[string]int),
+		resumeCh:    make(chan struct{}),
 	}
+	// A closed channel means the crawler is running, so a worker can pass the
+	// pause check without waiting.
+	close(e.resumeCh)
 	return e
 }
 
@@ -830,22 +835,54 @@ func (e *Engine) Requeue(rawURL string) bool {
 	return true
 }
 
+// Pause stops the workers before they take another URL. A URL that a worker
+// already holds waits for the resume instead of going back on the queue, so
+// its place, including a priority action, is kept.
 func (e *Engine) Pause() {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.paused {
+		return
+	}
 	e.paused = true
-	e.mu.Unlock()
+	e.resumeCh = make(chan struct{})
 }
 
 func (e *Engine) Resume() {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.paused {
+		return
+	}
 	e.paused = false
-	e.mu.Unlock()
+	close(e.resumeCh)
 }
 
 func (e *Engine) Paused() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.paused
+}
+
+// waitWhilePaused blocks until the crawler is running again. It returns false
+// when the context ends first, which lets a stopping worker leave without
+// touching the frontier.
+func (e *Engine) waitWhilePaused(ctx context.Context) bool {
+	for {
+		e.mu.Lock()
+		if !e.paused {
+			e.mu.Unlock()
+			return true
+		}
+		resume := e.resumeCh
+		e.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return false
+		case <-resume:
+		}
+	}
 }
 
 func (e *Engine) HostStats() map[string]HostStat {
@@ -1077,6 +1114,9 @@ func (e *Engine) worker(ctx context.Context) {
 	defer e.wg.Done()
 
 	for {
+		if !e.waitWhilePaused(ctx) {
+			return
+		}
 		// A URL an operator asked to prioritize is taken before the ordinary
 		// queue whenever a worker is free, so the frontier action has an
 		// effect straight away.
@@ -1101,12 +1141,10 @@ func (e *Engine) worker(ctx context.Context) {
 }
 
 func (e *Engine) handleItem(ctx context.Context, item crawlItem) {
-	if e.Paused() {
-		if !e.enqueue(item, 5*time.Second) {
-			e.mu.Lock()
-			delete(e.pending, item.url)
-			e.mu.Unlock()
-		}
+	// The pause may have started after the worker took the item. Hold it
+	// until the crawler runs again rather than putting it back, so a
+	// priority action is not lost.
+	if !e.waitWhilePaused(ctx) {
 		return
 	}
 	if delay := e.retryDelay(item.url); delay > 0 {

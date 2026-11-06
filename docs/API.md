@@ -373,6 +373,54 @@ Pagination metadata is also reported in the response headers:
 curl 'http://localhost:3000/api/crawl/queue?host=example.com&limit=20'
 ```
 
+### `POST /api/crawl/queue/drop`
+
+Remove one URL from the frontier and skip it. The URL is marked visited, so a
+link to the same page is not queued again until `POST /api/crawl/requeue`
+resets it. A URL that is waiting on a retry is dropped as well, and its
+per-host retry slot is released.
+
+Request body:
+
+```json
+{"url":"https://example.org/docs"}
+```
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","dropped":true}
+```
+
+Errors: `400` with a JSON error object when the body is not valid JSON, the
+`url` is empty, or the URL is not currently in the frontier. The same URL may
+be dropped only once; use requeue before dropping it again.
+
+### `POST /api/crawl/queue/prioritize`
+
+Move a queued URL to the front of the crawl order, so a free worker picks it
+up before the rest of the frontier. The URL stays in the frontier until a
+worker claims it, and the ordinary queue entry is discarded when the
+prioritized copy is taken. The action also works while the crawler is paused:
+the URL keeps its place until the workers resume.
+
+Request body:
+
+```json
+{"url":"https://example.org/docs"}
+```
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","prioritized":true}
+```
+
+Errors: `400` with a JSON error object when the body is not valid JSON, the
+`url` is empty, the URL is not queued, the URL is waiting on a retry window, or
+the priority queue is full. Use `POST /api/crawl/requeue` when a retry should
+skip its remaining wait.
+
 ### `POST /api/crawl`
 
 Seed a URL into the crawl frontier. Queues asynchronously; the crawler

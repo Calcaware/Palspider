@@ -154,6 +154,184 @@ func TestRequeueReleasesRetrySlot(t *testing.T) {
 	}
 }
 
+func TestDropURLRemovesAndSkipsQueuedURL(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/page"
+	e.Seed(rawURL)
+
+	if !e.DropURL(rawURL) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 0 {
+		t.Fatalf("frontier total = %d after a drop, want 0", snap.Total)
+	}
+
+	// A copy that is already on the worker queue must not be fetched after
+	// the drop, because the URL is no longer pending.
+	item := <-e.urlChan
+	if e.takeQueued(item) {
+		t.Fatal("a stale copy was processed after the URL was dropped")
+	}
+	if e.DropURL(rawURL) {
+		t.Fatal("dropping the same URL twice should return false")
+	}
+
+	if !e.Requeue(rawURL) {
+		t.Fatal("Requeue returned false after a drop")
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 1 {
+		t.Errorf("frontier total = %d after requeue, want 1", snap.Total)
+	}
+}
+
+func TestDropURLReleasesRetrySlot(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/broken"
+	e.scheduleRetry(rawURL, 1, errors.New("temporary network failure"))
+
+	if !e.DropURL(rawURL) {
+		t.Fatal("DropURL returned false for a retrying URL")
+	}
+	e.mu.Lock()
+	slots := e.hostRetries["example.com"]
+	_, retrying := e.retryAt[rawURL]
+	_, counted := e.retryCounts[rawURL]
+	e.mu.Unlock()
+	if slots != 0 || retrying || counted {
+		t.Errorf("after a drop: slots %d retrying %v counted %v, want 0 false false", slots, retrying, counted)
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 0 {
+		t.Errorf("frontier total = %d after dropping a retry, want 0", snap.Total)
+	}
+}
+
+func TestPrioritizeURLFrontLoadsQueuedCopy(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/first")
+	target := "https://example.com/second"
+	e.Seed(target)
+
+	if !e.PrioritizeURL(target) {
+		t.Fatal("PrioritizeURL returned false for a queued URL")
+	}
+	var prioritized crawlItem
+	select {
+	case prioritized = <-e.priorityChan:
+	default:
+		t.Fatal("no item was put on the priority queue")
+	}
+	if prioritized.url != target {
+		t.Fatalf("prioritized URL = %q, want %q", prioritized.url, target)
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 2 {
+		t.Fatalf("frontier total = %d, want both copies before the prioritized one is taken", snap.Total)
+	}
+
+	if !e.takeQueued(prioritized) {
+		t.Fatal("the prioritized copy should claim the pending URL")
+	}
+
+	// The ordinary copy is still in the worker queue but must be ignored.
+drain:
+	for {
+		select {
+		case item := <-e.urlChan:
+			if item.url == target && e.takeQueued(item) {
+				t.Fatal("a stale copy was processed after the prioritized copy")
+			}
+		default:
+			break drain
+		}
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 1 {
+		t.Errorf("frontier total = %d after taking the prioritized copy, want 1", snap.Total)
+	}
+}
+
+func TestPrioritizeURLRefusesRetryingAndUnknownURLs(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	retryURL := "https://example.com/broken"
+	e.scheduleRetry(retryURL, 0, errors.New("temporary network failure"))
+
+	if e.PrioritizeURL(retryURL) {
+		t.Error("PrioritizeURL accepted a URL that is waiting on a retry")
+	}
+	if e.PrioritizeURL("https://example.com/missing") {
+		t.Error("PrioritizeURL accepted a URL that is not in the frontier")
+	}
+}
+
+func TestWaitWhilePausedBlocksUntilResume(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Pause()
+
+	waited := make(chan bool, 1)
+	go func() { waited <- e.waitWhilePaused(context.Background()) }()
+
+	select {
+	case <-waited:
+		t.Fatal("waitWhilePaused returned while the crawler was paused")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	e.Resume()
+	select {
+	case ok := <-waited:
+		if !ok {
+			t.Fatal("waitWhilePaused returned false after resume")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitWhilePaused did not return after resume")
+	}
+}
+
+func TestWaitWhilePausedStopsWithContext(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Pause()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	waited := make(chan bool, 1)
+	go func() { waited <- e.waitWhilePaused(ctx) }()
+	cancel()
+
+	select {
+	case ok := <-waited:
+		if ok {
+			t.Fatal("waitWhilePaused returned true after the context ended")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waitWhilePaused did not return after the context ended")
+	}
+}
+
+func TestPausedWorkerLeavesFrontierInPlace(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Pause()
+	rawURL := "https://example.com/page"
+	e.Seed(rawURL)
+	if !e.PrioritizeURL(rawURL) {
+		t.Fatal("PrioritizeURL returned false for a queued URL")
+	}
+
+	e.Start(context.Background())
+	defer e.Stop()
+
+	// The worker must not take either copy while the crawler is paused.
+	// Before the fix it pulled the priority item and put it back on the
+	// ordinary queue, which lost the priority action.
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := len(e.priorityChan); got != 1 {
+			t.Fatalf("priority queue length = %d, want 1 while paused", got)
+		}
+		if got := len(e.urlChan); got != 1 {
+			t.Fatalf("worker queue length = %d, want 1 while paused", got)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestPermanentFailureClearsRetryStatus(t *testing.T) {
 	e := New(1, 10, 0, nil)
 	rawURL := "https://example.com/gone"

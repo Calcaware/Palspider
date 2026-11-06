@@ -106,6 +106,7 @@
         </div>
         <div class="modal-body">
           <p class="small text-secondary mb-2" id="frontierSummary">Loading...</p>
+          <p id="frontierError" class="text-danger small mb-2 d-none"></p>
           <div id="frontierHosts" class="mb-3"></div>
           <ul id="frontierItems" class="list-group list-group-flush small"></ul>
           <p id="frontierEmpty" class="text-secondary small mb-0 d-none">The frontier is empty.</p>
@@ -287,11 +288,18 @@
 
     const frontierModal = document.getElementById('frontierModal');
     const frontierSummary = document.getElementById('frontierSummary');
+    const frontierError = document.getElementById('frontierError');
     const frontierHosts = document.getElementById('frontierHosts');
     const frontierItems = document.getElementById('frontierItems');
     const frontierEmpty = document.getElementById('frontierEmpty');
 
+    function showFrontierError(message) {
+      frontierError.textContent = message;
+      frontierError.classList.remove('d-none');
+    }
+
     async function loadFrontier() {
+      frontierError.classList.add('d-none');
       try {
         const res = await fetch('/api/crawl/queue?limit=25');
         const data = await res.json();
@@ -313,7 +321,10 @@
         frontierItems.textContent = '';
         (data.items || []).forEach(item => {
           const li = document.createElement('li');
-          li.className = 'list-group-item px-0 py-1';
+          li.className = 'list-group-item px-0 py-1 d-flex justify-content-between align-items-start gap-2';
+
+          const info = document.createElement('div');
+          info.className = 'flex-grow-1';
           const link = document.createElement('div');
           link.className = 'text-break';
           link.textContent = item.url;
@@ -321,7 +332,28 @@
           meta.className = 'text-secondary';
           meta.textContent = 'depth ' + item.depth + ', ' + item.status +
             (item.status === 'retrying' && item.inSeconds ? ', retry in ' + item.inSeconds + 's' : '');
-          li.append(link, meta);
+          info.append(link, meta);
+
+          const actions = document.createElement('div');
+          actions.className = 'btn-group btn-group-sm flex-shrink-0';
+          if (item.status !== 'retrying') {
+            const prioritize = document.createElement('button');
+            prioritize.className = 'btn btn-outline-secondary';
+            prioritize.textContent = 'Prioritize';
+            prioritize.title = 'Fetch this URL before the rest of the queue';
+            prioritize.dataset.queueAction = 'prioritize';
+            prioritize.dataset.queueUrl = item.url;
+            actions.appendChild(prioritize);
+          }
+          const drop = document.createElement('button');
+          drop.className = 'btn btn-outline-danger';
+          drop.textContent = 'Drop';
+          drop.title = 'Skip this URL and do not queue it again';
+          drop.dataset.queueAction = 'drop';
+          drop.dataset.queueUrl = item.url;
+          actions.appendChild(drop);
+
+          li.append(info, actions);
           frontierItems.appendChild(li);
         });
         frontierEmpty.classList.toggle('d-none', (data.total || 0) > 0);
@@ -329,6 +361,31 @@
         frontierSummary.textContent = 'Could not load the crawl frontier.';
       }
     }
+
+    async function runFrontierAction(action, url) {
+      frontierError.classList.add('d-none');
+      try {
+        const res = await fetch('/api/crawl/queue/' + action, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({url}),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showFrontierError(err.error || 'The frontier action failed.');
+          return;
+        }
+        loadFrontier();
+      } catch (e) {
+        showFrontierError('Connection failed');
+      }
+    }
+
+    frontierItems.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-queue-action]');
+      if (!btn) return;
+      runFrontierAction(btn.dataset.queueAction, btn.dataset.queueUrl);
+    });
 
     frontierModal.addEventListener('shown.bs.modal', loadFrontier);
 
