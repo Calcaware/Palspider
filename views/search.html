@@ -311,11 +311,35 @@
           .sort((a, b) => (b[1].queued + b[1].retrying) - (a[1].queued + a[1].retrying))
           .slice(0, 6);
         hosts.forEach(([host, counts]) => {
-          const badge = document.createElement('span');
-          badge.className = 'badge text-bg-secondary me-1 mb-1';
-          badge.textContent = host + ': ' + counts.queued + ' queued' +
+          const row = document.createElement('div');
+          row.className = 'd-flex justify-content-between align-items-center gap-2 py-1 border-bottom';
+
+          const label = document.createElement('span');
+          label.className = 'small text-break';
+          label.textContent = host + ': ' + counts.queued + ' queued' +
             (counts.retrying ? ', ' + counts.retrying + ' retrying' : '');
-          frontierHosts.appendChild(badge);
+
+          const actions = document.createElement('div');
+          actions.className = 'btn-group btn-group-sm flex-shrink-0';
+          if (counts.queued > 0) {
+            const prioritize = document.createElement('button');
+            prioritize.className = 'btn btn-outline-secondary';
+            prioritize.textContent = 'Prioritize all';
+            prioritize.title = 'Fetch every queued URL from this site first';
+            prioritize.dataset.hostAction = 'prioritize';
+            prioritize.dataset.queueHost = host;
+            actions.appendChild(prioritize);
+          }
+          const drop = document.createElement('button');
+          drop.className = 'btn btn-outline-danger';
+          drop.textContent = 'Drop all';
+          drop.title = 'Skip every queued and retrying URL from this site';
+          drop.dataset.hostAction = 'drop';
+          drop.dataset.queueHost = host;
+          actions.appendChild(drop);
+
+          row.append(label, actions);
+          frontierHosts.appendChild(row);
         });
 
         frontierItems.textContent = '';
@@ -385,6 +409,34 @@
       const btn = e.target.closest('[data-queue-action]');
       if (!btn) return;
       runFrontierAction(btn.dataset.queueAction, btn.dataset.queueUrl);
+    });
+
+    async function runFrontierHostAction(action, host) {
+      if (action === 'drop' && !window.confirm('Drop every queued and retrying URL from ' + host + '?')) {
+        return;
+      }
+      frontierError.classList.add('d-none');
+      try {
+        const res = await fetch('/api/crawl/queue/host/' + action, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({host}),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showFrontierError(err.error || 'The frontier action failed.');
+          return;
+        }
+        loadFrontier();
+      } catch (e) {
+        showFrontierError('Connection failed');
+      }
+    }
+
+    frontierHosts.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-host-action]');
+      if (!btn) return;
+      runFrontierHostAction(btn.dataset.hostAction, btn.dataset.queueHost);
     });
 
     frontierModal.addEventListener('shown.bs.modal', loadFrontier);

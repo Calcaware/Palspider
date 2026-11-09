@@ -261,6 +261,105 @@ func TestPrioritizeURLRefusesRetryingAndUnknownURLs(t *testing.T) {
 	}
 }
 
+func TestDropHostDropsQueuedAndRetryingURLs(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/a")
+	e.Seed("https://www.example.com/b")
+	e.Seed("https://other.example.org/c")
+	retryURL := "https://example.com/broken"
+	e.scheduleRetry(retryURL, 1, errors.New("temporary network failure"))
+
+	if got := e.DropHost("example.com"); got != 3 {
+		t.Fatalf("DropHost dropped %d URLs, want 3 (the host and its subdomain)", got)
+	}
+
+	e.mu.Lock()
+	slots := e.hostRetries["example.com"]
+	_, retrying := e.retryAt[retryURL]
+	_, counted := e.retryCounts[retryURL]
+	e.mu.Unlock()
+	if slots != 0 || retrying || counted {
+		t.Errorf("after a host drop: slots %d retrying %v counted %v, want 0 false false", slots, retrying, counted)
+	}
+
+	snap := e.QueueSnapshot("", 0, 0)
+	if snap.Total != 1 || len(snap.Items) != 1 || snap.Items[0].URL != "https://other.example.org/c" {
+		t.Fatalf("frontier after a host drop = %+v, want only the other host", snap)
+	}
+
+	// Copies that were already in the queue must not be fetched after the
+	// drop, because those URLs are no longer pending.
+	dropped := map[string]bool{
+		"https://example.com/a":     true,
+		"https://www.example.com/b": true,
+		retryURL:                    true,
+	}
+drain:
+	for {
+		select {
+		case item := <-e.urlChan:
+			if !dropped[item.url] {
+				continue
+			}
+			if e.takeQueued(item) {
+				t.Fatalf("a stale copy of %q was processed after the host drop", item.url)
+			}
+		default:
+			break drain
+		}
+	}
+
+	if got := e.DropHost("missing.example"); got != 0 {
+		t.Errorf("DropHost on an unknown host dropped %d URLs, want 0", got)
+	}
+	if got := e.DropHost(""); got != 0 {
+		t.Errorf("DropHost with an empty host dropped %d URLs, want 0", got)
+	}
+}
+
+func TestPrioritizeHostFrontLoadsOnlyQueuedURLs(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/a")
+	e.Seed("https://example.com/b")
+	e.Seed("https://other.example.org/c")
+	retryURL := "https://example.com/broken"
+	e.scheduleRetry(retryURL, 1, errors.New("temporary network failure"))
+
+	if got := e.PrioritizeHost("example.com"); got != 2 {
+		t.Fatalf("PrioritizeHost prioritized %d URLs, want 2 queued URLs", got)
+	}
+
+	prioritized := make(map[string]bool)
+	for range 2 {
+		select {
+		case item := <-e.priorityChan:
+			prioritized[item.url] = true
+		default:
+			t.Fatal("the priority queue holds fewer items than PrioritizeHost reported")
+		}
+	}
+	if !prioritized["https://example.com/a"] || !prioritized["https://example.com/b"] {
+		t.Errorf("prioritized = %v, want both queued example.com URLs", prioritized)
+	}
+
+	e.mu.Lock()
+	_, retrying := e.retryAt[retryURL]
+	e.mu.Unlock()
+	if !retrying {
+		t.Error("a retrying URL was moved out of its retry window")
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 4 {
+		t.Errorf("frontier total = %d, want every entry to stay in place", snap.Total)
+	}
+
+	if got := e.PrioritizeHost("missing.example"); got != 0 {
+		t.Errorf("PrioritizeHost on an unknown host prioritized %d URLs, want 0", got)
+	}
+	if got := e.PrioritizeHost(""); got != 0 {
+		t.Errorf("PrioritizeHost with an empty host prioritized %d URLs, want 0", got)
+	}
+}
+
 func TestWaitWhilePausedBlocksUntilResume(t *testing.T) {
 	e := New(1, 10, 0, nil)
 	e.Pause()

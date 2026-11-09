@@ -127,6 +127,30 @@ func TestDeleteVisitedBatch(t *testing.T) {
 	}
 }
 
+func TestMarkVisitedBatch(t *testing.T) {
+	s := openTestStore(t)
+
+	if err := s.MarkVisitedBatch([]string{"https://a.com/", "https://b.com/"}); err != nil {
+		t.Fatalf("MarkVisitedBatch: %v", err)
+	}
+
+	visited := []string{}
+	if err := s.AllVisited(func(url string) error {
+		visited = append(visited, url)
+		return nil
+	}); err != nil {
+		t.Fatalf("AllVisited: %v", err)
+	}
+	if len(visited) != 2 {
+		t.Fatalf("visited = %v, want two URLs", visited)
+	}
+
+	// An empty batch is a no-op.
+	if err := s.MarkVisitedBatch(nil); err != nil {
+		t.Fatalf("MarkVisitedBatch(nil): %v", err)
+	}
+}
+
 func TestVisitedAndFingerprints(t *testing.T) {
 	s := openTestStore(t)
 

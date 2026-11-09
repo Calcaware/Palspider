@@ -147,6 +147,23 @@ func (s *Store) MarkVisited(url string) error {
 	})
 }
 
+// MarkVisitedBatch records several URLs as visited in one transaction, so a
+// bulk frontier action does not cost one commit per URL.
+func (s *Store) MarkVisitedBatch(urls []string) error {
+	if len(urls) == 0 {
+		return nil
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket([]byte("visited"))
+		for _, url := range urls {
+			if err := bucket.Put([]byte(url), []byte{1}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // DeleteVisited removes a URL from the visited set (used when a seed could
 // not be queued and must be retriable).
 func (s *Store) DeleteVisited(url string) error {

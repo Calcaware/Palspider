@@ -810,6 +810,73 @@ func (e *Engine) PrioritizeURL(rawURL string) bool {
 	}
 }
 
+// DropHost removes every frontier entry for host and its subdomains and marks
+// those URLs visited, so links to them are not queued again until Requeue
+// resets them. Retrying URLs are dropped as well, and their per-host retry
+// slots are released. It returns how many entries were dropped.
+func (e *Engine) DropHost(host string) int {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" {
+		return 0
+	}
+
+	e.mu.Lock()
+	var dropped []string
+	for rawURL := range e.pending {
+		if !hostMatchesURL(rawURL, host) {
+			continue
+		}
+		dropped = append(dropped, rawURL)
+		delete(e.pending, rawURL)
+		delete(e.retryCounts, rawURL)
+		if _, retrying := e.retryAt[rawURL]; retrying {
+			delete(e.retryAt, rawURL)
+			e.releaseHostRetryLocked(rawURL)
+		}
+		e.visited[rawURL] = struct{}{}
+	}
+	e.mu.Unlock()
+
+	if e.Store != nil && len(dropped) > 0 {
+		if err := e.Store.MarkVisitedBatch(dropped); err != nil {
+			log.Printf("drop host: %v", err)
+		}
+	}
+	return len(dropped)
+}
+
+// PrioritizeHost puts every queued URL for host and its subdomains at the
+// front of the crawl order. URLs waiting on a retry window are left alone
+// because that wait is part of the host's politeness budget; use Requeue when
+// the wait should be skipped. It returns how many URLs were prioritized, which
+// may be lower than the host backlog when the priority queue is full.
+func (e *Engine) PrioritizeHost(host string) int {
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" {
+		return 0
+	}
+
+	prioritized := 0
+	e.mu.Lock()
+	for rawURL, depth := range e.pending {
+		if !hostMatchesURL(rawURL, host) {
+			continue
+		}
+		if _, retrying := e.retryAt[rawURL]; retrying {
+			continue
+		}
+		select {
+		case e.priorityChan <- crawlItem{url: rawURL, depth: depth}:
+			prioritized++
+		default:
+			e.mu.Unlock()
+			return prioritized
+		}
+	}
+	e.mu.Unlock()
+	return prioritized
+}
+
 func (e *Engine) Requeue(rawURL string) bool {
 	normalized := crawler.NormalizeURL(rawURL)
 	e.mu.Lock()

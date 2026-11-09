@@ -421,6 +421,59 @@ Errors: `400` with a JSON error object when the body is not valid JSON, the
 the priority queue is full. Use `POST /api/crawl/requeue` when a retry should
 skip its remaining wait.
 
+### `POST /api/crawl/queue/host/drop`
+
+Remove every URL that belongs to one host and its subdomains from the frontier
+and skip them. Each URL is marked visited, so links to those pages are not
+queued again until `POST /api/crawl/requeue` resets them. Retrying URLs are
+dropped as well, and their per-host retry slots are released. The action is
+safe to repeat: a host with nothing queued returns `dropped: 0`.
+
+Request body:
+
+```json
+{"host":"example.com"}
+```
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","host":"example.com","dropped":12}
+```
+
+The host is lowercased and leading or trailing dots are removed before it is
+matched. `www.example.com` and `docs.example.com` are included when
+`example.com` is given. Errors: `400` with a JSON error object when the body is
+not valid JSON, the `host` is empty, or the host includes a scheme, path, or
+whitespace.
+
+### `POST /api/crawl/queue/host/prioritize`
+
+Move every queued URL for one host and its subdomains to the front of the
+crawl order. URLs waiting on a retry window are left alone, because that wait
+belongs to the host's politeness budget; use `POST /api/crawl/requeue` when a
+retry should skip the remaining wait. The URLs stay in the frontier until a
+worker claims them, and the ordinary queue entries are discarded as the
+prioritized copies are taken. The action also works while the crawler is
+paused.
+
+Request body:
+
+```json
+{"host":"example.com"}
+```
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","host":"example.com","prioritized":12}
+```
+
+`prioritized` is the number of URLs moved to the front. It can be lower than
+the host backlog when the priority queue is full, and it is `0` when the host
+has no queued URLs or every entry is retrying. Errors are the same as for the
+bulk drop.
+
 ### `POST /api/crawl`
 
 Seed a URL into the crawl frontier. Queues asynchronously; the crawler

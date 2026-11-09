@@ -638,6 +638,85 @@ func TestAPICrawlQueueDropAndPrioritize(t *testing.T) {
 	}
 }
 
+func TestAPICrawlQueueHostActions(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Pause()
+	e.Seed("https://example.com/a")
+	e.Seed("https://www.example.com/b")
+	e.Seed("https://other.example.org/c")
+
+	var prioritized struct {
+		Status      string `json:"status"`
+		Host        string `json:"host"`
+		Prioritized int    `json:"prioritized"`
+	}
+	resp := postJSON(t, ts.URL+"/api/crawl/queue/host/prioritize", `{"host":" Example.COM. "}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/host/prioritize status = %d, want 200", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &prioritized)
+	if prioritized.Host != "example.com" || prioritized.Prioritized != 2 {
+		t.Errorf("prioritize response = %+v, want the normalized host and 2 URLs", prioritized)
+	}
+
+	var dropped struct {
+		Status  string `json:"status"`
+		Host    string `json:"host"`
+		Dropped int    `json:"dropped"`
+	}
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/host/drop", `{"host":"example.com"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/host/drop status = %d, want 200", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &dropped)
+	if dropped.Host != "example.com" || dropped.Dropped != 2 {
+		t.Errorf("drop response = %+v, want the host and 2 dropped URLs", dropped)
+	}
+
+	code, _, body := get(t, ts.URL+"/api/crawl/queue")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/crawl/queue = %d, want 200", code)
+	}
+	var snap engine.QueueSnapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("queue snapshot: %v", err)
+	}
+	if snap.Total != 1 || len(snap.Items) != 1 || snap.Items[0].URL != "https://other.example.org/c" {
+		t.Errorf("frontier after a host drop = %+v, want only the other host", snap)
+	}
+
+	// A bulk action on a host with nothing queued is a successful no-op.
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/host/drop", `{"host":"example.com"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Errorf("second bulk drop status = %d, want 200", resp.StatusCode)
+	} else {
+		decodeJSON(t, resp, &dropped)
+		if dropped.Dropped != 0 {
+			t.Errorf("second bulk drop = %d URLs, want 0", dropped.Dropped)
+		}
+	}
+
+	for _, action := range []string{"drop", "prioritize"} {
+		for _, payload := range []string{
+			`{not json`,
+			`{}`,
+			`{"host":"https://example.com"}`,
+			`{"host":"exa mple.com"}`,
+		} {
+			resp = postJSON(t, ts.URL+"/api/crawl/queue/host/"+action, payload)
+			resp.Body.Close()
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Errorf("POST /api/crawl/queue/host/%s %s = %d, want 400", action, payload, resp.StatusCode)
+			}
+		}
+	}
+}
+
 func TestAPICrawlAppliesExclusions(t *testing.T) {
 	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/search,/login")
 	ts, done := newTestServer(t)

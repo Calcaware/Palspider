@@ -143,6 +143,8 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("GET /api/crawl/queue", handleAPICrawlQueue(e))
 	mux.HandleFunc("POST /api/crawl/queue/drop", handleAPICrawlQueueDrop(e))
 	mux.HandleFunc("POST /api/crawl/queue/prioritize", handleAPICrawlQueuePrioritize(e))
+	mux.HandleFunc("POST /api/crawl/queue/host/drop", handleAPICrawlQueueHostDrop(e))
+	mux.HandleFunc("POST /api/crawl/queue/host/prioritize", handleAPICrawlQueueHostPrioritize(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
 	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
 	mux.HandleFunc("POST /api/crawl/resume", handleAPICrawlResume(e))
@@ -761,6 +763,56 @@ func handleAPICrawlQueuePrioritize(e *engine.Engine) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "prioritized": true})
 	}
+}
+
+func handleAPICrawlQueueHostDrop(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, ok := queueHostFromRequest(w, r)
+		if !ok {
+			return
+		}
+		dropped := e.DropHost(host)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "ok", "host": host, "dropped": dropped,
+		})
+	}
+}
+
+func handleAPICrawlQueueHostPrioritize(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, ok := queueHostFromRequest(w, r)
+		if !ok {
+			return
+		}
+		prioritized := e.PrioritizeHost(host)
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "ok", "host": host, "prioritized": prioritized,
+		})
+	}
+}
+
+// queueHostFromRequest decodes the host field shared by the bulk frontier
+// actions. The host names a site only, so a scheme, path, or whitespace is
+// rejected instead of silently matching nothing.
+func queueHostFromRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var body struct {
+		Host string `json:"host"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+		return "", false
+	}
+	host := strings.Trim(strings.ToLower(strings.TrimSpace(body.Host)), ".")
+	if host == "" {
+		writeJSONError(w, http.StatusBadRequest, "host required")
+		return "", false
+	}
+	if strings.ContainsAny(host, "/\\@") || strings.ContainsAny(host, " \t\r\n") {
+		writeJSONError(w, http.StatusBadRequest, "host must be a domain name without a scheme or path")
+		return "", false
+	}
+	return host, true
 }
 
 // handleSuggest serves term autocomplete. limit defaults to 5 and is clamped
