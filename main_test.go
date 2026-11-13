@@ -717,6 +717,64 @@ func TestAPICrawlQueueHostActions(t *testing.T) {
 	}
 }
 
+func TestAPICrawlQueueUndo(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Pause()
+	e.Seed("https://example.com/a")
+	e.Seed("https://www.example.com/b")
+	e.Seed("https://other.example.org/c")
+
+	resp := postJSON(t, ts.URL+"/api/crawl/queue/host/drop", `{"host":"example.com"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/host/drop status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	resp = getResp(t, ts.URL+"/api/crawl/queue")
+	var snap engine.QueueSnapshot
+	decodeJSON(t, resp, &snap)
+	if snap.LastDrop == nil || snap.LastDrop.Host != "example.com" || snap.LastDrop.URLs != 2 {
+		t.Fatalf("lastDrop = %+v, want the example.com batch with 2 URLs", snap.LastDrop)
+	}
+
+	var restored struct {
+		Status   string `json:"status"`
+		Host     string `json:"host"`
+		Restored int    `json:"restored"`
+	}
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/undo", "")
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/undo status = %d, want 200", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &restored)
+	if restored.Host != "example.com" || restored.Restored != 2 {
+		t.Errorf("undo response = %+v, want example.com and 2 restored URLs", restored)
+	}
+
+	code, _, body := get(t, ts.URL+"/api/crawl/queue")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/crawl/queue = %d, want 200", code)
+	}
+	snap = engine.QueueSnapshot{}
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("queue snapshot: %v", err)
+	}
+	if snap.Total != 3 || snap.LastDrop != nil {
+		t.Errorf("frontier after undo = total %d lastDrop %+v, want 3 entries and no pending batch",
+			snap.Total, snap.LastDrop)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/undo", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("second undo = %d, want 400", resp.StatusCode)
+	}
+}
+
 func TestAPICrawlAppliesExclusions(t *testing.T) {
 	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/search,/login")
 	ts, done := newTestServer(t)

@@ -321,7 +321,8 @@ is non-zero. `retrying` counts the URLs parked on a retry window,
 `retryBudget` is the per-host cap (zero means unlimited), `retryQueues` maps a
 host to the number of retries it currently holds, and `retries` lists those
 parked URLs with their retry time. The retry fields are omitted when no URL is
-waiting on a retry.
+waiting on a retry. `lastDrop` is present when a bulk host drop can still be
+undone, with the host, URL count, and RFC 3339 time of the drop.
 
 This is what the web UI polls every three seconds.
 
@@ -350,6 +351,7 @@ Query parameters:
   "hosts": {
     "example.com": {"queued": 1, "retrying": 1}
   },
+  "lastDrop": {"host": "example.org", "urls": 12, "at": "2026-10-28T08:15:00Z"},
   "items": [
     {"url": "https://example.com/next", "host": "example.com", "depth": 1, "status": "queued"},
     {"url": "https://example.com/broken", "host": "example.com", "depth": 2, "status": "retrying", "retryAt": "2026-10-28T09:12:05Z", "inSeconds": 3480}
@@ -363,7 +365,9 @@ frontier entries (`queued` plus `retrying`), and `hosts` covers every matching
 host even when the returned page is smaller than the frontier. A `retrying`
 item also carries `retryAt` (RFC 3339) and `inSeconds`, which counts down to
 the retry and is omitted once the window has opened. Items that a worker is
-currently fetching are not listed.
+currently fetching are not listed. `lastDrop` describes the most recent
+non-empty bulk host drop that can still be undone, and is omitted when there is
+nothing to restore. The `at` field is the RFC 3339 time of the drop.
 
 Pagination metadata is also reported in the response headers:
 `X-Palspider-Count`, `X-Palspider-Offset`, `X-Palspider-Limit`, and
@@ -427,7 +431,9 @@ Remove every URL that belongs to one host and its subdomains from the frontier
 and skip them. Each URL is marked visited, so links to those pages are not
 queued again until `POST /api/crawl/requeue` resets them. Retrying URLs are
 dropped as well, and their per-host retry slots are released. The action is
-safe to repeat: a host with nothing queued returns `dropped: 0`.
+safe to repeat: a host with nothing queued returns `dropped: 0`. A non-empty
+drop is remembered as the last batch, so `POST /api/crawl/queue/undo` can put
+those URLs back without requeueing them one by one.
 
 Request body:
 
@@ -473,6 +479,31 @@ Success (`200 OK`):
 the host backlog when the priority queue is full, and it is `0` when the host
 has no queued URLs or every entry is retrying. Errors are the same as for the
 bulk drop.
+
+### `POST /api/crawl/queue/undo`
+
+Restore the URLs removed by the most recent non-empty bulk host drop. The
+endpoint takes no body. Each URL is removed from the visited set and put back
+on the frontier at its previous depth. A URL that was waiting on a retry keeps
+the remaining part of its window and its attempt count, so a host that is still
+down is not hit early. URLs that are already back in the frontier are left
+alone, which means a link discovery that ran between the drop and the undo is
+not duplicated.
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","host":"example.com","restored":12}
+```
+
+`restored` is the number of URLs put back on the frontier. A batch can be
+undone once. A second undo, or an undo after `POST /api/crawl/clear`, returns
+`400` with `{"error":"no dropped batch to restore"}`. The batch is held in
+memory, so it does not survive a restart.
+
+```sh
+curl -X POST http://localhost:3000/api/crawl/queue/undo
+```
 
 ### `POST /api/crawl`
 

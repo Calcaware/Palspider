@@ -145,6 +145,7 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("POST /api/crawl/queue/prioritize", handleAPICrawlQueuePrioritize(e))
 	mux.HandleFunc("POST /api/crawl/queue/host/drop", handleAPICrawlQueueHostDrop(e))
 	mux.HandleFunc("POST /api/crawl/queue/host/prioritize", handleAPICrawlQueueHostPrioritize(e))
+	mux.HandleFunc("POST /api/crawl/queue/undo", handleAPICrawlQueueUndo(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
 	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
 	mux.HandleFunc("POST /api/crawl/resume", handleAPICrawlResume(e))
@@ -787,6 +788,21 @@ func handleAPICrawlQueueHostPrioritize(e *engine.Engine) http.HandlerFunc {
 		prioritized := e.PrioritizeHost(host)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status": "ok", "host": host, "prioritized": prioritized,
+		})
+	}
+}
+
+// handleAPICrawlQueueUndo restores the URLs removed by the last bulk host
+// drop. The batch can be restored once, so a second call is a 400.
+func handleAPICrawlQueueUndo(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		host, restored := e.UndoDropHost()
+		if restored == 0 {
+			writeJSONError(w, http.StatusBadRequest, "no dropped batch to restore")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "ok", "host": host, "restored": restored,
 		})
 	}
 }

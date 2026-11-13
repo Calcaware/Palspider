@@ -105,7 +105,10 @@
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
-          <p class="small text-secondary mb-2" id="frontierSummary">Loading...</p>
+          <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
+            <p class="small text-secondary mb-0" id="frontierSummary">Loading...</p>
+            <button class="btn btn-sm btn-outline-warning d-none flex-shrink-0" id="frontierUndo" type="button" title="Restore the URLs removed by the last bulk drop">Undo last drop</button>
+          </div>
           <p id="frontierError" class="text-danger small mb-2 d-none"></p>
           <div id="frontierHosts" class="mb-3"></div>
           <ul id="frontierItems" class="list-group list-group-flush small"></ul>
@@ -292,6 +295,7 @@
     const frontierHosts = document.getElementById('frontierHosts');
     const frontierItems = document.getElementById('frontierItems');
     const frontierEmpty = document.getElementById('frontierEmpty');
+    const frontierUndo = document.getElementById('frontierUndo');
 
     function showFrontierError(message) {
       frontierError.textContent = message;
@@ -305,6 +309,14 @@
         const data = await res.json();
         frontierSummary.textContent =
           data.queued + ' queued, ' + data.retrying + ' retrying, ' + data.total + ' total';
+
+        if (data.lastDrop) {
+          frontierUndo.textContent = 'Undo drop of ' + data.lastDrop.urls + ' from ' + data.lastDrop.host;
+          frontierUndo.classList.remove('d-none');
+        } else {
+          frontierUndo.textContent = 'Undo last drop';
+          frontierUndo.classList.add('d-none');
+        }
 
         frontierHosts.textContent = '';
         const hosts = Object.entries(data.hosts || {})
@@ -437,6 +449,24 @@
       const btn = e.target.closest('[data-host-action]');
       if (!btn) return;
       runFrontierHostAction(btn.dataset.hostAction, btn.dataset.queueHost);
+    });
+
+    frontierUndo.addEventListener('click', async () => {
+      frontierError.classList.add('d-none');
+      frontierUndo.disabled = true;
+      try {
+        const res = await fetch('/api/crawl/queue/undo', {method: 'POST'});
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showFrontierError(err.error || 'The last drop could not be restored.');
+          return;
+        }
+        loadFrontier();
+      } catch (e) {
+        showFrontierError('Connection failed');
+      } finally {
+        frontierUndo.disabled = false;
+      }
     });
 
     frontierModal.addEventListener('shown.bs.modal', loadFrontier);

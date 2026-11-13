@@ -107,30 +107,31 @@ type Engine struct {
 	Store     *store.Store
 	limiter   *crawler.RateLimiter
 
-	workers     int
-	maxDepth    int
-	maxPages    int
-	maxPerHost  int
-	retryWindow time.Duration
-	retryBudget int
-	urlChan     chan crawlItem
+	workers      int
+	maxDepth     int
+	maxPages     int
+	maxPerHost   int
+	retryWindow  time.Duration
+	retryBudget  int
+	urlChan      chan crawlItem
 	priorityChan chan crawlItem
-	visited     map[string]struct{}
-	fpSeen      map[string]struct{}
-	pending     map[string]int
-	retryCounts map[string]int
-	retryAt     map[string]time.Time
-	hostRetries map[string]int
-	queueGen    uint64
-	hostStats   map[string]HostStat
-	hostDocs    map[string]int
-	paused      bool
-	resumeCh    chan struct{}
-	mu          sync.Mutex
-	wg          sync.WaitGroup
-	active      int32
-	cancel      context.CancelFunc
-	queueSize   int32
+	visited      map[string]struct{}
+	fpSeen       map[string]struct{}
+	pending      map[string]int
+	retryCounts  map[string]int
+	retryAt      map[string]time.Time
+	hostRetries  map[string]int
+	queueGen     uint64
+	hostStats    map[string]HostStat
+	hostDocs     map[string]int
+	lastDrop     *droppedBatch
+	paused       bool
+	resumeCh     chan struct{}
+	mu           sync.Mutex
+	wg           sync.WaitGroup
+	active       int32
+	cancel       context.CancelFunc
+	queueSize    int32
 }
 
 type HostStat struct {
@@ -152,10 +153,10 @@ type Stats struct {
 }
 
 type RetryStatus struct {
-	URL    string `json:"url"`
-	Host   string `json:"host"`
+	URL     string `json:"url"`
+	Host    string `json:"host"`
 	RetryAt string `json:"retryAt"`
-	In     int64  `json:"inSeconds"`
+	In      int64  `json:"inSeconds"`
 }
 
 // QueueItem is one URL waiting in the crawl frontier. Status is "queued"
@@ -178,7 +179,8 @@ type QueueHost struct {
 
 // QueueSnapshot is a point in time view of the crawl frontier. Hosts covers
 // every host in the filtered snapshot, including entries outside the returned
-// page, so callers can see the backlog without reading every item.
+// page, so callers can see the backlog without reading every item. LastDrop
+// describes the most recent non-empty bulk drop that can still be undone.
 type QueueSnapshot struct {
 	QueueSize int                  `json:"queueSize"`
 	Total     int                  `json:"total"`
@@ -187,7 +189,30 @@ type QueueSnapshot struct {
 	Offset    int                  `json:"offset"`
 	Limit     int                  `json:"limit"`
 	Hosts     map[string]QueueHost `json:"hosts"`
+	LastDrop  *DroppedBatch        `json:"lastDrop,omitempty"`
 	Items     []QueueItem          `json:"items"`
+}
+
+// DroppedBatch describes the URLs removed by the most recent non-empty bulk
+// frontier drop. The batch stays available until it is undone or the queue is
+// cleared, so an operator can restore it without requeueing each URL.
+type DroppedBatch struct {
+	Host string `json:"host"`
+	URLs int    `json:"urls"`
+	At   string `json:"at"`
+}
+
+type droppedURL struct {
+	url        string
+	depth      int
+	retryAt    time.Time
+	retryCount int
+}
+
+type droppedBatch struct {
+	host  string
+	at    time.Time
+	items []droppedURL
 }
 
 type CrawlStatus struct {
@@ -203,6 +228,7 @@ type CrawlStatus struct {
 	RetryBudget int                 `json:"retryBudget"`
 	RetryQueues map[string]int      `json:"retryQueues,omitempty"`
 	Retries     []RetryStatus       `json:"retries,omitempty"`
+	LastDrop    *DroppedBatch       `json:"lastDrop,omitempty"`
 }
 
 // New creates an engine. maxDepth < 0 means unlimited crawl depth; maxPages
@@ -215,30 +241,30 @@ func New(workerCount, maxDepth, maxPages int, st *store.Store) *Engine {
 	ls := indexer.NewLinkStore()
 
 	e := &Engine{
-		Indexer:     ix,
-		Trie:        tr,
-		Searcher:    searcher.New(ix, tr),
-		LinkStore:   ls,
-		Peers:       peer.New(),
-		Store:       st,
-		limiter:     crawler.NewRateLimiter(200 * time.Millisecond),
-		workers:     workerCount,
-		maxDepth:    maxDepth,
-		maxPages:    maxPages,
-		maxPerHost:  crawler.MaxPagesPerHost(),
-		retryWindow: retryWindowFromEnv(),
-		retryBudget: retryBudgetFromEnv(),
-		urlChan:     make(chan crawlItem, 100000),
+		Indexer:      ix,
+		Trie:         tr,
+		Searcher:     searcher.New(ix, tr),
+		LinkStore:    ls,
+		Peers:        peer.New(),
+		Store:        st,
+		limiter:      crawler.NewRateLimiter(200 * time.Millisecond),
+		workers:      workerCount,
+		maxDepth:     maxDepth,
+		maxPages:     maxPages,
+		maxPerHost:   crawler.MaxPagesPerHost(),
+		retryWindow:  retryWindowFromEnv(),
+		retryBudget:  retryBudgetFromEnv(),
+		urlChan:      make(chan crawlItem, 100000),
 		priorityChan: make(chan crawlItem, priorityQueueSize),
-		visited:     make(map[string]struct{}),
-		fpSeen:      make(map[string]struct{}),
-		pending:     make(map[string]int),
-		retryCounts: make(map[string]int),
-		retryAt:     make(map[string]time.Time),
-		hostRetries: make(map[string]int),
-		hostStats:   make(map[string]HostStat),
-		hostDocs:    make(map[string]int),
-		resumeCh:    make(chan struct{}),
+		visited:      make(map[string]struct{}),
+		fpSeen:       make(map[string]struct{}),
+		pending:      make(map[string]int),
+		retryCounts:  make(map[string]int),
+		retryAt:      make(map[string]time.Time),
+		hostRetries:  make(map[string]int),
+		hostStats:    make(map[string]HostStat),
+		hostDocs:     make(map[string]int),
+		resumeCh:     make(chan struct{}),
 	}
 	// A closed channel means the crawler is running, so a worker can pass the
 	// pause check without waiting.
@@ -729,6 +755,9 @@ func (e *Engine) ClearQueue() {
 	for host := range e.hostRetries {
 		delete(e.hostRetries, host)
 	}
+	// A cleared queue has nothing left to restore, so an older bulk drop
+	// must not come back through the undo action.
+	e.lastDrop = nil
 	e.mu.Unlock()
 
 	var dropped []string
@@ -813,7 +842,8 @@ func (e *Engine) PrioritizeURL(rawURL string) bool {
 // DropHost removes every frontier entry for host and its subdomains and marks
 // those URLs visited, so links to them are not queued again until Requeue
 // resets them. Retrying URLs are dropped as well, and their per-host retry
-// slots are released. It returns how many entries were dropped.
+// slots are released. The dropped set is remembered so UndoDropHost can put it
+// back. It returns how many entries were dropped.
 func (e *Engine) DropHost(host string) int {
 	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), ".")
 	if host == "" {
@@ -822,10 +852,16 @@ func (e *Engine) DropHost(host string) int {
 
 	e.mu.Lock()
 	var dropped []string
-	for rawURL := range e.pending {
+	var items []droppedURL
+	for rawURL, depth := range e.pending {
 		if !hostMatchesURL(rawURL, host) {
 			continue
 		}
+		entry := droppedURL{url: rawURL, depth: depth, retryCount: e.retryCounts[rawURL]}
+		if at, retrying := e.retryAt[rawURL]; retrying {
+			entry.retryAt = at
+		}
+		items = append(items, entry)
 		dropped = append(dropped, rawURL)
 		delete(e.pending, rawURL)
 		delete(e.retryCounts, rawURL)
@@ -835,6 +871,9 @@ func (e *Engine) DropHost(host string) int {
 		}
 		e.visited[rawURL] = struct{}{}
 	}
+	if len(items) > 0 {
+		e.lastDrop = &droppedBatch{host: host, at: time.Now(), items: items}
+	}
 	e.mu.Unlock()
 
 	if e.Store != nil && len(dropped) > 0 {
@@ -843,6 +882,96 @@ func (e *Engine) DropHost(host string) int {
 		}
 	}
 	return len(dropped)
+}
+
+// UndoDropHost restores the URLs removed by the most recent non-empty bulk
+// frontier drop. URLs that were waiting on a retry keep the remaining part of
+// their window and attempt count, while the rest go back on the queue. A batch
+// can be undone once; the next call returns an empty host and zero URLs.
+func (e *Engine) UndoDropHost() (string, int) {
+	e.mu.Lock()
+	batch := e.lastDrop
+	e.lastDrop = nil
+	e.mu.Unlock()
+	if batch == nil {
+		return "", 0
+	}
+
+	// Clear the persisted visited marks before the URLs become pending again.
+	// A worker that claims a restored URL writes the mark back afterwards, so
+	// the database never ends up with an in-memory visited URL that the store
+	// forgot.
+	if e.Store != nil {
+		urls := make([]string, 0, len(batch.items))
+		for _, entry := range batch.items {
+			urls = append(urls, entry.url)
+		}
+		if err := e.Store.DeleteVisitedBatch(urls); err != nil {
+			log.Printf("undo drop: %v", err)
+		}
+	}
+
+	now := time.Now()
+	items := make([]crawlItem, 0, len(batch.items))
+	e.mu.Lock()
+	for _, entry := range batch.items {
+		if _, pending := e.pending[entry.url]; pending {
+			// Something queued the URL again in the meantime, so leave that
+			// copy alone instead of adding a duplicate.
+			continue
+		}
+		e.pending[entry.url] = entry.depth
+		delete(e.visited, entry.url)
+		if entry.retryCount > 0 {
+			e.retryCounts[entry.url] = entry.retryCount
+		}
+		if !entry.retryAt.IsZero() && entry.retryAt.After(now) {
+			e.retryAt[entry.url] = entry.retryAt
+			if host := hostOf(entry.url); host != "" {
+				e.hostRetries[host]++
+			}
+		}
+		items = append(items, crawlItem{url: entry.url, depth: entry.depth})
+	}
+	e.mu.Unlock()
+
+	queued := 0
+	for _, item := range items {
+		if e.enqueue(item, 0) {
+			queued++
+			continue
+		}
+		// The queue was full, so roll the entry back and let a later link
+		// discovery pick the URL up again.
+		e.mu.Lock()
+		delete(e.pending, item.url)
+		delete(e.retryCounts, item.url)
+		if _, retrying := e.retryAt[item.url]; retrying {
+			delete(e.retryAt, item.url)
+			e.releaseHostRetryLocked(item.url)
+		}
+		e.mu.Unlock()
+	}
+	return batch.host, queued
+}
+
+// LastDropInfo describes the bulk drop that UndoDropHost would restore, or nil
+// when there is nothing to undo.
+func (e *Engine) LastDropInfo() *DroppedBatch {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.lastDropInfoLocked()
+}
+
+func (e *Engine) lastDropInfoLocked() *DroppedBatch {
+	if e.lastDrop == nil {
+		return nil
+	}
+	return &DroppedBatch{
+		Host: e.lastDrop.host,
+		URLs: len(e.lastDrop.items),
+		At:   e.lastDrop.at.Format(time.RFC3339),
+	}
 }
 
 // PrioritizeHost puts every queued URL for host and its subdomains at the
@@ -1067,14 +1196,15 @@ func (e *Engine) CrawlStatus() CrawlStatus {
 			in = 0
 		}
 		retries = append(retries, RetryStatus{
-			URL:      u,
-			Host:     hostOf(u),
-			RetryAt:  at.Format(time.RFC3339),
-			In:       in,
+			URL:     u,
+			Host:    hostOf(u),
+			RetryAt: at.Format(time.RFC3339),
+			In:      in,
 		})
 	}
 	retrying := len(e.retryAt)
 	retryBudget := e.retryBudget
+	lastDrop := e.lastDropInfoLocked()
 	e.mu.Unlock()
 	queueSize := atomic.LoadInt32(&e.queueSize)
 	active := atomic.LoadInt32(&e.active)
@@ -1091,6 +1221,7 @@ func (e *Engine) CrawlStatus() CrawlStatus {
 		RetryBudget: retryBudget,
 		RetryQueues: retryQueues,
 		Retries:     retries,
+		LastDrop:    lastDrop,
 	}
 }
 
@@ -1136,6 +1267,7 @@ func (e *Engine) QueueSnapshot(host string, offset, limit int) QueueSnapshot {
 		hosts[item.Host] = entry
 		items = append(items, item)
 	}
+	lastDrop := e.lastDropInfoLocked()
 	e.mu.Unlock()
 
 	sort.Slice(items, func(i, j int) bool {
@@ -1160,6 +1292,7 @@ func (e *Engine) QueueSnapshot(host string, offset, limit int) QueueSnapshot {
 		Offset:    offset,
 		Limit:     limit,
 		Hosts:     hosts,
+		LastDrop:  lastDrop,
 		Items:     items,
 	}
 }

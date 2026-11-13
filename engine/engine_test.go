@@ -317,6 +317,117 @@ drain:
 	}
 }
 
+func TestUndoDropHostRestoresQueuedURLs(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/a")
+	e.Seed("https://www.example.com/b")
+	e.Seed("https://other.example.org/c")
+
+	if got := e.DropHost("example.com"); got != 2 {
+		t.Fatalf("DropHost dropped %d URLs, want 2", got)
+	}
+	info := e.LastDropInfo()
+	if info == nil || info.Host != "example.com" || info.URLs != 2 || info.At == "" {
+		t.Fatalf("last drop = %+v, want the example.com batch with a timestamp", info)
+	}
+	if status := e.CrawlStatus(); status.LastDrop == nil || status.LastDrop.URLs != 2 {
+		t.Errorf("crawl status last drop = %+v, want the pending batch", status.LastDrop)
+	}
+
+	host, restored := e.UndoDropHost()
+	if host != "example.com" || restored != 2 {
+		t.Fatalf("UndoDropHost = %q %d, want example.com and 2 URLs", host, restored)
+	}
+	if e.LastDropInfo() != nil {
+		t.Error("the last drop is still available after it was undone")
+	}
+
+	snap := e.QueueSnapshot("", 0, 0)
+	if snap.Total != 3 || snap.LastDrop != nil {
+		t.Fatalf("frontier after undo = total %d lastDrop %+v, want 3 entries and no pending batch",
+			snap.Total, snap.LastDrop)
+	}
+	for _, rawURL := range []string{
+		"https://example.com/a",
+		"https://www.example.com/b",
+	} {
+		e.mu.Lock()
+		_, visited := e.visited[rawURL]
+		_, pending := e.pending[rawURL]
+		e.mu.Unlock()
+		if visited {
+			t.Errorf("%s is still visited after the undo", rawURL)
+		}
+		if !pending {
+			t.Errorf("%s is not pending after the undo", rawURL)
+		}
+	}
+	e.mu.Lock()
+	_, otherPending := e.pending["https://other.example.org/c"]
+	e.mu.Unlock()
+	if !otherPending {
+		t.Error("the URL from the other host was removed by the undo")
+	}
+
+	if host, restored := e.UndoDropHost(); host != "" || restored != 0 {
+		t.Errorf("second UndoDropHost = %q %d, want nothing left to restore", host, restored)
+	}
+}
+
+func TestUndoDropHostRestoresRetryWindow(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/broken"
+	e.scheduleRetry(rawURL, 2, errors.New("temporary network failure"))
+	// Remove the copy scheduleRetry queued so only the undo puts one back.
+	<-e.urlChan
+
+	if got := e.DropHost("example.com"); got != 1 {
+		t.Fatalf("DropHost dropped %d URLs, want 1", got)
+	}
+	host, restored := e.UndoDropHost()
+	if host != "example.com" || restored != 1 {
+		t.Fatalf("UndoDropHost = %q %d, want example.com and 1 URL", host, restored)
+	}
+
+	e.mu.Lock()
+	at, retrying := e.retryAt[rawURL]
+	slots := e.hostRetries["example.com"]
+	count := e.retryCounts[rawURL]
+	depth := e.pending[rawURL]
+	e.mu.Unlock()
+	if !retrying || !at.After(time.Now()) {
+		t.Errorf("retry window = %v (set %v), want a future window after the undo", at, retrying)
+	}
+	if slots != 1 {
+		t.Errorf("host retry slots = %d, want the restored retry to hold one", slots)
+	}
+	if count != 1 {
+		t.Errorf("retry count = %d, want the previous attempt to be kept", count)
+	}
+	if depth != 2 {
+		t.Errorf("pending depth = %d, want 2", depth)
+	}
+	if len(e.urlChan) != 1 {
+		t.Errorf("queue = %d items, want the restored retry to be queued again", len(e.urlChan))
+	}
+}
+
+func TestClearQueueClearsLastDrop(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/a")
+	if got := e.DropHost("example.com"); got != 1 {
+		t.Fatalf("DropHost dropped %d URLs, want 1", got)
+	}
+
+	e.ClearQueue()
+	if e.LastDropInfo() != nil {
+		t.Error("clearing the queue kept a bulk drop that could still be undone")
+	}
+	if host, restored := e.UndoDropHost(); host != "" || restored != 0 {
+		t.Errorf("UndoDropHost after a clear = %q %d, want nothing", host, restored)
+	}
+}
+
 func TestPrioritizeHostFrontLoadsOnlyQueuedURLs(t *testing.T) {
 	e := New(1, 10, 0, nil)
 	e.Seed("https://example.com/a")
