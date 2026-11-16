@@ -322,7 +322,8 @@ is non-zero. `retrying` counts the URLs parked on a retry window,
 host to the number of retries it currently holds, and `retries` lists those
 parked URLs with their retry time. The retry fields are omitted when no URL is
 waiting on a retry. `lastDrop` is present when a bulk host drop can still be
-undone, with the host, URL count, and RFC 3339 time of the drop.
+undone, with the host, URL count, and RFC 3339 time of the drop. The batch is
+persisted, so the undo survives a restart.
 
 This is what the web UI polls every three seconds.
 
@@ -367,7 +368,8 @@ item also carries `retryAt` (RFC 3339) and `inSeconds`, which counts down to
 the retry and is omitted once the window has opened. Items that a worker is
 currently fetching are not listed. `lastDrop` describes the most recent
 non-empty bulk host drop that can still be undone, and is omitted when there is
-nothing to restore. The `at` field is the RFC 3339 time of the drop.
+nothing to restore. The batch is persisted, so it is still reported after a
+restart. The `at` field is the RFC 3339 time of the drop.
 
 Pagination metadata is also reported in the response headers:
 `X-Palspider-Count`, `X-Palspider-Offset`, `X-Palspider-Limit`, and
@@ -498,8 +500,9 @@ Success (`200 OK`):
 
 `restored` is the number of URLs put back on the frontier. A batch can be
 undone once. A second undo, or an undo after `POST /api/crawl/clear`, returns
-`400` with `{"error":"no dropped batch to restore"}`. The batch is held in
-memory, so it does not survive a restart.
+`400` with `{"error":"no dropped batch to restore"}`. The batch is stored in
+the database, so it survives a restart and the undo still works after the
+process comes back up.
 
 ```sh
 curl -X POST http://localhost:3000/api/crawl/queue/undo

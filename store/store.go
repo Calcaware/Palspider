@@ -271,3 +271,35 @@ func (s *Store) AllHostCounts(fn func(host string, count int) error) error {
 		})
 	})
 }
+
+// SaveLastDrop stores the bulk frontier drop that can still be undone, so the
+// batch survives a restart. The caller owns the shape of the JSON payload.
+func (s *Store) SaveLastDrop(batch interface{}) error {
+	data, err := json.Marshal(batch)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("meta")).Put([]byte("lastDrop"), data)
+	})
+}
+
+// LoadLastDrop returns the persisted bulk frontier drop, or nil when there is
+// nothing to restore.
+func (s *Store) LoadLastDrop() ([]byte, error) {
+	var data []byte
+	err := s.db.View(func(tx *bolt.Tx) error {
+		if v := tx.Bucket([]byte("meta")).Get([]byte("lastDrop")); v != nil {
+			data = append([]byte(nil), v...)
+		}
+		return nil
+	})
+	return data, err
+}
+
+// ClearLastDrop forgets the persisted bulk frontier drop.
+func (s *Store) ClearLastDrop() error {
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("meta")).Delete([]byte("lastDrop"))
+	})
+}

@@ -151,6 +151,46 @@ func TestMarkVisitedBatch(t *testing.T) {
 	}
 }
 
+func TestLastDropRoundtrip(t *testing.T) {
+	s := openTestStore(t)
+
+	if data, err := s.LoadLastDrop(); err != nil || data != nil {
+		t.Fatalf("LoadLastDrop on a new store = %q, %v; want nil", data, err)
+	}
+
+	batch := map[string]interface{}{
+		"host": "example.com",
+		"urls": []string{"https://example.com/a", "https://example.com/b"},
+	}
+	if err := s.SaveLastDrop(batch); err != nil {
+		t.Fatalf("SaveLastDrop: %v", err)
+	}
+
+	data, err := s.LoadLastDrop()
+	if err != nil {
+		t.Fatalf("LoadLastDrop: %v", err)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode last drop: %v", err)
+	}
+	if got["host"] != "example.com" {
+		t.Errorf("last drop host = %v, want example.com", got["host"])
+	}
+
+	if err := s.ClearLastDrop(); err != nil {
+		t.Fatalf("ClearLastDrop: %v", err)
+	}
+	if data, err := s.LoadLastDrop(); err != nil || data != nil {
+		t.Errorf("LoadLastDrop after clear = %q, %v; want nil", data, err)
+	}
+
+	// Clearing an empty slot is a no-op.
+	if err := s.ClearLastDrop(); err != nil {
+		t.Fatalf("ClearLastDrop on an empty slot: %v", err)
+	}
+}
+
 func TestVisitedAndFingerprints(t *testing.T) {
 	s := openTestStore(t)
 

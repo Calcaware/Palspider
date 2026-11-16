@@ -215,6 +215,58 @@ type droppedBatch struct {
 	items []droppedURL
 }
 
+// persistedDrop is the on-disk shape of a bulk frontier drop. The fields are
+// exported so encoding/json can read the batch back after a restart.
+type persistedDrop struct {
+	Host  string             `json:"host"`
+	At    time.Time          `json:"at"`
+	Items []persistedDropURL `json:"items"`
+}
+
+type persistedDropURL struct {
+	URL        string    `json:"url"`
+	Depth      int       `json:"depth"`
+	RetryAt    time.Time `json:"retryAt,omitempty"`
+	RetryCount int       `json:"retryCount,omitempty"`
+}
+
+func (b *droppedBatch) persistable() persistedDrop {
+	out := persistedDrop{
+		Host:  b.host,
+		At:    b.at,
+		Items: make([]persistedDropURL, 0, len(b.items)),
+	}
+	for _, entry := range b.items {
+		out.Items = append(out.Items, persistedDropURL{
+			URL:        entry.url,
+			Depth:      entry.depth,
+			RetryAt:    entry.retryAt,
+			RetryCount: entry.retryCount,
+		})
+	}
+	return out
+}
+
+func restoreDroppedBatch(saved persistedDrop) *droppedBatch {
+	if len(saved.Items) == 0 {
+		return nil
+	}
+	batch := &droppedBatch{
+		host:  saved.Host,
+		at:    saved.At,
+		items: make([]droppedURL, 0, len(saved.Items)),
+	}
+	for _, entry := range saved.Items {
+		batch.items = append(batch.items, droppedURL{
+			url:        entry.URL,
+			depth:      entry.Depth,
+			retryAt:    entry.RetryAt,
+			retryCount: entry.RetryCount,
+		})
+	}
+	return batch
+}
+
 type CrawlStatus struct {
 	QueueSize   int32               `json:"queueSize"`
 	Active      int32               `json:"active"`
@@ -327,6 +379,28 @@ func (e *Engine) Restore() error {
 	})
 	if err != nil {
 		return err
+	}
+
+	// A bulk frontier drop survives a restart, so the undo action still
+	// works after the process comes back up. The URLs themselves are already
+	// in the visited set and are only put back on the frontier by the undo.
+	saved, err := e.Store.LoadLastDrop()
+	if err != nil {
+		return err
+	}
+	if len(saved) > 0 {
+		var batch persistedDrop
+		if err := json.Unmarshal(saved, &batch); err != nil {
+			return err
+		}
+		e.lastDrop = restoreDroppedBatch(batch)
+		if e.lastDrop == nil {
+			// An empty record has nothing to restore, so do not carry it
+			// into the next restart.
+			if err := e.Store.ClearLastDrop(); err != nil {
+				return err
+			}
+		}
 	}
 
 	// Rebuild host counts from restored documents to ensure accuracy
@@ -756,8 +830,9 @@ func (e *Engine) ClearQueue() {
 		delete(e.hostRetries, host)
 	}
 	// A cleared queue has nothing left to restore, so an older bulk drop
-	// must not come back through the undo action.
+	// must not come back through the undo action, even after a restart.
 	e.lastDrop = nil
+	e.saveLastDropLocked()
 	e.mu.Unlock()
 
 	var dropped []string
@@ -873,6 +948,7 @@ func (e *Engine) DropHost(host string) int {
 	}
 	if len(items) > 0 {
 		e.lastDrop = &droppedBatch{host: host, at: time.Now(), items: items}
+		e.saveLastDropLocked()
 	}
 	e.mu.Unlock()
 
@@ -891,16 +967,17 @@ func (e *Engine) DropHost(host string) int {
 func (e *Engine) UndoDropHost() (string, int) {
 	e.mu.Lock()
 	batch := e.lastDrop
-	e.lastDrop = nil
-	e.mu.Unlock()
 	if batch == nil {
+		e.mu.Unlock()
 		return "", 0
 	}
+	e.lastDrop = nil
 
 	// Clear the persisted visited marks before the URLs become pending again.
 	// A worker that claims a restored URL writes the mark back afterwards, so
 	// the database never ends up with an in-memory visited URL that the store
-	// forgot.
+	// forgot. The persisted batch is cleared after the visited marks, so an
+	// interrupted undo can still be retried after a restart.
 	if e.Store != nil {
 		urls := make([]string, 0, len(batch.items))
 		for _, entry := range batch.items {
@@ -910,6 +987,8 @@ func (e *Engine) UndoDropHost() (string, int) {
 			log.Printf("undo drop: %v", err)
 		}
 	}
+	e.saveLastDropLocked()
+	e.mu.Unlock()
 
 	now := time.Now()
 	items := make([]crawlItem, 0, len(batch.items))
@@ -961,6 +1040,24 @@ func (e *Engine) LastDropInfo() *DroppedBatch {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.lastDropInfoLocked()
+}
+
+// saveLastDropLocked writes the current undo batch, or removes it when there
+// is nothing left to restore. The caller must hold e.mu so concurrent bulk
+// drops cannot persist their batches out of order.
+func (e *Engine) saveLastDropLocked() {
+	if e.Store == nil {
+		return
+	}
+	var err error
+	if e.lastDrop == nil {
+		err = e.Store.ClearLastDrop()
+	} else {
+		err = e.Store.SaveLastDrop(e.lastDrop.persistable())
+	}
+	if err != nil {
+		log.Printf("persist last drop: %v", err)
+	}
 }
 
 func (e *Engine) lastDropInfoLocked() *DroppedBatch {

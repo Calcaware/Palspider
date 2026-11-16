@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/calcaware/palspider/crawler"
 	"github.com/calcaware/palspider/searcher"
+	"github.com/calcaware/palspider/store"
 )
 
 func TestMergeResultsDedupesAndSorts(t *testing.T) {
@@ -425,6 +427,86 @@ func TestClearQueueClearsLastDrop(t *testing.T) {
 	}
 	if host, restored := e.UndoDropHost(); host != "" || restored != 0 {
 		t.Errorf("UndoDropHost after a clear = %q %d, want nothing", host, restored)
+	}
+}
+
+func TestUndoDropHostSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "engine.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	e := New(1, 10, 0, st)
+	e.Seed("https://example.com/a")
+	e.Seed("https://www.example.com/b")
+	retryURL := "https://example.com/broken"
+	e.scheduleRetry(retryURL, 2, errors.New("temporary network failure"))
+	// Remove the copy scheduleRetry queued so the batch only holds bookkeeping.
+	<-e.urlChan
+
+	if got := e.DropHost("example.com"); got != 3 {
+		t.Fatalf("DropHost dropped %d URLs, want 3", got)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+
+	restored := New(1, 10, 0, st)
+	if err := restored.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	info := restored.LastDropInfo()
+	if info == nil || info.Host != "example.com" || info.URLs != 3 {
+		t.Fatalf("last drop after restart = %+v, want the example.com batch with 3 URLs", info)
+	}
+
+	host, count := restored.UndoDropHost()
+	if host != "example.com" || count != 3 {
+		t.Fatalf("UndoDropHost after restart = %q %d, want example.com and 3 URLs", host, count)
+	}
+
+	restored.mu.Lock()
+	at, retrying := restored.retryAt[retryURL]
+	slots := restored.hostRetries["example.com"]
+	attempts := restored.retryCounts[retryURL]
+	_, pending := restored.pending[retryURL]
+	_, visited := restored.visited[retryURL]
+	restored.mu.Unlock()
+	if !retrying || !at.After(time.Now()) {
+		t.Errorf("restored retry window = %v (set %v), want a future window", at, retrying)
+	}
+	if slots != 1 {
+		t.Errorf("host retry slots = %d, want the restored retry to hold one", slots)
+	}
+	if attempts != 1 {
+		t.Errorf("retry count = %d, want the attempt count from before the restart", attempts)
+	}
+	if !pending || visited {
+		t.Errorf("restored retry pending %v visited %v, want pending and not visited", pending, visited)
+	}
+
+	// The undo is consumed, so another restart must not bring the batch back.
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+
+	again := New(1, 10, 0, st)
+	if err := again.Restore(); err != nil {
+		t.Fatalf("Restore after undo: %v", err)
+	}
+	if again.LastDropInfo() != nil {
+		t.Error("the undone batch came back after a restart")
 	}
 }
 

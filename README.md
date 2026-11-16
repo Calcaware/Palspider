@@ -52,13 +52,14 @@ deduplicated by URL, and peer lists gossip automatically.
   to the front of the crawl order, and a host row can drop every queued or
   retrying URL from that site, or prioritize all of its queued URLs, at once.
   The last bulk drop can be restored with one click, including any retry
-  windows it held.
+  windows it held. The undo batch is persisted, so it is still available after
+  a restart.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
   concurrently with a hard 2 s time budget, results merge deduplicated by URL,
   peer lists gossip on contact, and peers track last-seen status.
-- **Persistence** - index, visited URLs, fingerprints, and link counts are
-  stored in a single bbolt database and restored on boot. Each crawled page
-  persists in one transaction.
+- **Persistence** - index, visited URLs, fingerprints, link counts, and the
+  last bulk frontier drop are stored in a single bbolt database and restored on
+  boot. Each crawled page persists in one transaction.
 - **Web UI** - Bootstrap 5 dark/light theme, live crawl stats, seed-URL
   dialog, frontier inspector, peer management, paginated results (10 per page,
   100 max), 404 page. Templates and assets are embedded in the binary
@@ -321,10 +322,10 @@ The test suite covers URL normalization, crawl exclusions (global and per host),
 robots rule precedence and crawl-delay parsing, per-host and per-page crawl
 budgets, retry requeueing and backoff jitter, queue clearing, dropping and
 prioritizing a single frontier URL or every URL for one host, undoing a bulk
-drop, text and link extraction, tokenizing, rate limiting, the private-address
-guard, trie concurrency, index bookkeeping, prefix lookups, ranking and
-suggestions, batch persistence, result merging, document export (JSON and
-streaming NDJSON), and peer URL handling.
+drop and restoring it across a restart, text and link extraction, tokenizing,
+rate limiting, the private-address guard, trie concurrency, index bookkeeping,
+prefix lookups, ranking and suggestions, batch persistence, result merging,
+document export (JSON and streaming NDJSON), and peer URL handling.
 
 ## Known issues
 
@@ -354,7 +355,8 @@ Things that are still wrong or missing after the current round of fixes:
    results.
 8. **The crawl frontier is not persisted.** Visited URLs survive restarts, but
    links that were queued and not yet processed are rediscovered on the next
-   crawl of their parent.
+   crawl of their parent. The last bulk frontier drop is the exception: its
+   batch is stored so the undo action still works after a restart.
 9. **No charset handling.** Pages that are not UTF-8 will be indexed with
    mangled bytes.
 10. **Link discovery can drop URLs under load.** The frontier is a fixed-size
