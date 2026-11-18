@@ -120,7 +120,8 @@ Tasks:
 - [x] Add bulk frontier actions so every queued or retrying URL for one host can be dropped or prioritized at once.
 - [x] Add an undo for a bulk frontier drop so an operator can restore the last set of URLs without requeueing them one by one.
 - [x] Persist the last bulk frontier drop across restarts so the undo action survives a reboot.
-- [ ] Add a way to discard the remembered bulk drop without clearing the frontier.
+- [x] Add a way to discard the remembered bulk drop without clearing the frontier.
+- [ ] Add an undo for a single frontier URL drop.
 - [ ] Add pause/resume/restart controls for the crawler.
 - [ ] Add per-domain crawl budgets and priority scheduling.
 - [ ] Add domain-level status and queue backlog display.

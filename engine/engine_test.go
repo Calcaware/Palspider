@@ -430,6 +430,106 @@ func TestClearQueueClearsLastDrop(t *testing.T) {
 	}
 }
 
+func TestUndoDropHostReportsBatchWithNoRestoredURLs(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/a"
+	e.Seed(rawURL)
+	if got := e.DropHost("example.com"); got != 1 {
+		t.Fatalf("DropHost dropped %d URLs, want 1", got)
+	}
+	// A link discovery or requeue between the drop and the undo can put the
+	// URL back, leaving the batch with nothing to restore.
+	if !e.Requeue(rawURL) {
+		t.Fatal("Requeue failed for the dropped URL")
+	}
+
+	host, restored := e.UndoDropHost()
+	if host != "example.com" || restored != 0 {
+		t.Fatalf("UndoDropHost = %q %d, want example.com and no restored URLs", host, restored)
+	}
+	if e.LastDropInfo() != nil {
+		t.Error("the empty undo left a batch behind")
+	}
+	if host, restored := e.UndoDropHost(); host != "" || restored != 0 {
+		t.Errorf("second UndoDropHost = %q %d, want nothing", host, restored)
+	}
+}
+
+func TestDiscardLastDropLeavesFrontierAlone(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/a")
+	e.Seed("https://other.example.org/c")
+	if got := e.DropHost("example.com"); got != 1 {
+		t.Fatalf("DropHost dropped %d URLs, want 1", got)
+	}
+
+	if !e.DiscardLastDrop() {
+		t.Fatal("DiscardLastDrop reported no batch to discard")
+	}
+	if e.DiscardLastDrop() {
+		t.Error("DiscardLastDrop succeeded twice")
+	}
+	if info := e.LastDropInfo(); info != nil {
+		t.Errorf("last drop = %+v, want it discarded", info)
+	}
+	if status := e.CrawlStatus(); status.LastDrop != nil {
+		t.Errorf("crawl status last drop = %+v, want no pending batch", status.LastDrop)
+	}
+
+	snap := e.QueueSnapshot("", 0, 0)
+	if snap.Total != 1 || snap.LastDrop != nil || len(snap.Items) != 1 ||
+		snap.Items[0].URL != "https://other.example.org/c" {
+		t.Errorf("frontier after discard = %+v, want only the other host and no batch", snap)
+	}
+	e.mu.Lock()
+	_, visited := e.visited["https://example.com/a"]
+	_, pending := e.pending["https://example.com/a"]
+	e.mu.Unlock()
+	if !visited || pending {
+		t.Errorf("discarded URL visited %v pending %v, want visited and not pending", visited, pending)
+	}
+	if host, restored := e.UndoDropHost(); host != "" || restored != 0 {
+		t.Errorf("UndoDropHost after discard = %q %d, want nothing", host, restored)
+	}
+}
+
+func TestDiscardLastDropSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "engine.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	e := New(1, 10, 0, st)
+	e.Seed("https://example.com/a")
+	if got := e.DropHost("example.com"); got != 1 {
+		t.Fatalf("DropHost dropped %d URLs, want 1", got)
+	}
+	if !e.DiscardLastDrop() {
+		t.Fatal("DiscardLastDrop reported no batch to discard")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+
+	again := New(1, 10, 0, st)
+	if err := again.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if info := again.LastDropInfo(); info != nil {
+		t.Errorf("last drop after restart = %+v, want it discarded", info)
+	}
+	if host, restored := again.UndoDropHost(); host != "" || restored != 0 {
+		t.Errorf("UndoDropHost after restart = %q %d, want nothing", host, restored)
+	}
+}
+
 func TestUndoDropHostSurvivesRestart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "engine.db")
 	st, err := store.Open(path)

@@ -1034,6 +1034,21 @@ func (e *Engine) UndoDropHost() (string, int) {
 	return batch.host, queued
 }
 
+// DiscardLastDrop forgets the remembered bulk drop without touching the
+// frontier. The dropped URLs stay visited and out of the queue, so only the
+// chance to undo the drop is lost. It reports whether there was a batch to
+// discard.
+func (e *Engine) DiscardLastDrop() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.lastDrop == nil {
+		return false
+	}
+	e.lastDrop = nil
+	e.saveLastDropLocked()
+	return true
+}
+
 // LastDropInfo describes the bulk drop that UndoDropHost would restore, or nil
 // when there is nothing to undo.
 func (e *Engine) LastDropInfo() *DroppedBatch {

@@ -146,6 +146,7 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("POST /api/crawl/queue/host/drop", handleAPICrawlQueueHostDrop(e))
 	mux.HandleFunc("POST /api/crawl/queue/host/prioritize", handleAPICrawlQueueHostPrioritize(e))
 	mux.HandleFunc("POST /api/crawl/queue/undo", handleAPICrawlQueueUndo(e))
+	mux.HandleFunc("POST /api/crawl/queue/undo/discard", handleAPICrawlQueueUndoDiscard(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
 	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
 	mux.HandleFunc("POST /api/crawl/resume", handleAPICrawlResume(e))
@@ -797,13 +798,25 @@ func handleAPICrawlQueueHostPrioritize(e *engine.Engine) http.HandlerFunc {
 func handleAPICrawlQueueUndo(e *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		host, restored := e.UndoDropHost()
-		if restored == 0 {
+		if host == "" {
 			writeJSONError(w, http.StatusBadRequest, "no dropped batch to restore")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status": "ok", "host": host, "restored": restored,
 		})
+	}
+}
+
+// handleAPICrawlQueueUndoDiscard forgets the remembered bulk drop so it can no
+// longer be restored. The queued URLs themselves are left alone.
+func handleAPICrawlQueueUndoDiscard(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !e.DiscardLastDrop() {
+			writeJSONError(w, http.StatusBadRequest, "no dropped batch to discard")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "discarded": true})
 	}
 }
 

@@ -52,14 +52,16 @@ deduplicated by URL, and peer lists gossip automatically.
   to the front of the crawl order, and a host row can drop every queued or
   retrying URL from that site, or prioritize all of its queued URLs, at once.
   The last bulk drop can be restored with one click, including any retry
-  windows it held. The undo batch is persisted, so it is still available after
-  a restart.
+  windows it held, or forgotten with another click when the drop should stay
+  in place. The undo batch is persisted, so it is still available after a
+  restart.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
   concurrently with a hard 2 s time budget, results merge deduplicated by URL,
   peer lists gossip on contact, and peers track last-seen status.
 - **Persistence** - index, visited URLs, fingerprints, link counts, and the
   last bulk frontier drop are stored in a single bbolt database and restored on
-  boot. Each crawled page persists in one transaction.
+  boot. The saved drop can be discarded without touching the frontier. Each
+  crawled page persists in one transaction.
 - **Web UI** - Bootstrap 5 dark/light theme, live crawl stats, seed-URL
   dialog, frontier inspector, peer management, paginated results (10 per page,
   100 max), 404 page. Templates and assets are embedded in the binary
@@ -228,6 +230,7 @@ Results are sorted by descending score, rounded to two decimals.
 | `visited` | URL | `0x01` |
 | `fingerprints` | MD5 hex | `0x01` |
 | `meta` | `nextDocID` | 8-byte big endian next document ID |
+| `meta` | `lastDrop` | JSON batch from the last bulk frontier drop, kept for undo |
 
 Everything is loaded back into memory on startup (`Engine.Restore`).
 
@@ -275,6 +278,7 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `POST /api/crawl/queue/host/drop` | `{"host":"example.com"}` - drop every queued or retrying URL for one host and its subdomains. |
 | `POST /api/crawl/queue/host/prioritize` | `{"host":"example.com"}` - move every queued URL for one host and its subdomains to the front. Retrying URLs are left in place. |
 | `POST /api/crawl/queue/undo` | Restore the URLs removed by the last bulk host drop, including their remaining retry windows. A batch can be undone once. |
+| `POST /api/crawl/queue/undo/discard` | Forget the remembered bulk drop without changing the frontier. The dropped URLs stay skipped. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
 | `POST /api/crawl/pause` | Stop the workers from picking up new URLs. |
 | `POST /api/crawl/resume` | Let the workers pick up URLs again. |
@@ -321,10 +325,11 @@ go test -race ./... # same, with the race detector (needs CGO / gcc)
 The test suite covers URL normalization, crawl exclusions (global and per host),
 robots rule precedence and crawl-delay parsing, per-host and per-page crawl
 budgets, retry requeueing and backoff jitter, queue clearing, dropping and
-prioritizing a single frontier URL or every URL for one host, undoing a bulk
-drop and restoring it across a restart, text and link extraction, tokenizing,
-rate limiting, the private-address guard, trie concurrency, index bookkeeping,
-prefix lookups, ranking and suggestions, batch persistence, result merging,
+prioritizing a single frontier URL or every URL for one host, undoing or
+discarding a bulk drop and restoring it across a restart, text and link
+extraction, tokenizing, rate limiting, the private-address guard, trie
+concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
+persistence, result merging,
 document export (JSON and streaming NDJSON), and peer URL handling.
 
 ## Known issues

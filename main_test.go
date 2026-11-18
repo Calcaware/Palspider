@@ -775,6 +775,93 @@ func TestAPICrawlQueueUndo(t *testing.T) {
 	}
 }
 
+func TestAPICrawlQueueUndoWithNothingLeftToRestore(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Pause()
+	rawURL := "https://example.com/a"
+	e.Seed(rawURL)
+
+	resp := postJSON(t, ts.URL+"/api/crawl/queue/host/drop", `{"host":"example.com"}`)
+	resp.Body.Close()
+	if !e.Requeue(rawURL) {
+		t.Fatal("Requeue failed for the dropped URL")
+	}
+
+	var restored struct {
+		Status   string `json:"status"`
+		Host     string `json:"host"`
+		Restored int    `json:"restored"`
+	}
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/undo", "")
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("undo status = %d, want 200", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &restored)
+	if restored.Status != "ok" || restored.Host != "example.com" || restored.Restored != 0 {
+		t.Errorf("undo response = %+v, want ok, example.com, and 0 restored", restored)
+	}
+
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/undo", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("second undo = %d, want 400", resp.StatusCode)
+	}
+}
+
+func TestAPICrawlQueueUndoDiscard(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Pause()
+	e.Seed("https://example.com/a")
+	e.Seed("https://other.example.org/c")
+
+	resp := postJSON(t, ts.URL+"/api/crawl/queue/host/drop", `{"host":"example.com"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/host/drop status = %d, want 200", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	var discarded struct {
+		Status    string `json:"status"`
+		Discarded bool   `json:"discarded"`
+	}
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/undo/discard", "")
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("POST /api/crawl/queue/undo/discard status = %d, want 200", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &discarded)
+	if discarded.Status != "ok" || !discarded.Discarded {
+		t.Errorf("discard response = %+v, want ok and discarded", discarded)
+	}
+
+	code, _, body := get(t, ts.URL+"/api/crawl/queue")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/crawl/queue = %d, want 200", code)
+	}
+	var snap engine.QueueSnapshot
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("queue snapshot: %v", err)
+	}
+	if snap.Total != 1 || snap.LastDrop != nil || len(snap.Items) != 1 ||
+		snap.Items[0].URL != "https://other.example.org/c" {
+		t.Errorf("frontier after discard = %+v, want the other host only and no batch", snap)
+	}
+
+	for _, path := range []string{"/api/crawl/queue/undo/discard", "/api/crawl/queue/undo"} {
+		resp = postJSON(t, ts.URL+path, "")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("second POST %s = %d, want 400", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestAPICrawlAppliesExclusions(t *testing.T) {
 	t.Setenv("PALSPIDER_EXCLUDE_PATHS", "/search,/login")
 	ts, done := newTestServer(t)

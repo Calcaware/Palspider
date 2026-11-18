@@ -323,7 +323,8 @@ host to the number of retries it currently holds, and `retries` lists those
 parked URLs with their retry time. The retry fields are omitted when no URL is
 waiting on a retry. `lastDrop` is present when a bulk host drop can still be
 undone, with the host, URL count, and RFC 3339 time of the drop. The batch is
-persisted, so the undo survives a restart.
+persisted, so the undo survives a restart and can also be discarded through
+`POST /api/crawl/queue/undo/discard`.
 
 This is what the web UI polls every three seconds.
 
@@ -369,7 +370,8 @@ the retry and is omitted once the window has opened. Items that a worker is
 currently fetching are not listed. `lastDrop` describes the most recent
 non-empty bulk host drop that can still be undone, and is omitted when there is
 nothing to restore. The batch is persisted, so it is still reported after a
-restart. The `at` field is the RFC 3339 time of the drop.
+restart. The `at` field is the RFC 3339 time of the drop. Use
+`POST /api/crawl/queue/undo/discard` to forget it without changing the frontier.
 
 Pagination metadata is also reported in the response headers:
 `X-Palspider-Count`, `X-Palspider-Offset`, `X-Palspider-Limit`, and
@@ -498,14 +500,38 @@ Success (`200 OK`):
 {"status":"ok","host":"example.com","restored":12}
 ```
 
-`restored` is the number of URLs put back on the frontier. A batch can be
-undone once. A second undo, or an undo after `POST /api/crawl/clear`, returns
-`400` with `{"error":"no dropped batch to restore"}`. The batch is stored in
-the database, so it survives a restart and the undo still works after the
-process comes back up.
+`restored` is the number of URLs put back on the frontier. It can be `0` when
+every URL in the batch was already queued again in the meantime; the batch is
+still consumed and the request succeeds. A batch can be undone once. A second
+undo, or an undo after `POST /api/crawl/clear`, returns `400` with
+`{"error":"no dropped batch to restore"}`. The batch is stored in the database,
+so it survives a restart and the undo still works after the process comes back
+up.
 
 ```sh
 curl -X POST http://localhost:3000/api/crawl/queue/undo
+```
+
+### `POST /api/crawl/queue/undo/discard`
+
+Forget the remembered bulk drop so it can no longer be undone. The endpoint
+takes no body and leaves the frontier untouched. The URLs from the drop stay
+visited and skipped, so a later link to one of them does not queue it again.
+Use `POST /api/crawl/requeue` or `POST /api/crawl/clear` when those URLs should
+be crawled again.
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","discarded":true}
+```
+
+With no batch to discard the response is `400` with
+`{"error":"no dropped batch to discard"}`. The saved batch is removed from the
+database as well, so a restart does not bring it back.
+
+```sh
+curl -X POST http://localhost:3000/api/crawl/queue/undo/discard
 ```
 
 ### `POST /api/crawl`

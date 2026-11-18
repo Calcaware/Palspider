@@ -105,9 +105,12 @@
           <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
         </div>
         <div class="modal-body">
-          <div class="d-flex justify-content-between align-items-center gap-2 mb-2">
-            <p class="small text-secondary mb-0" id="frontierSummary">Loading...</p>
-            <button class="btn btn-sm btn-outline-warning d-none flex-shrink-0" id="frontierUndo" type="button" title="Restore the URLs removed by the last bulk drop">Undo last drop</button>
+          <div class="d-flex align-items-center gap-2 mb-2">
+            <p class="small text-secondary mb-0 flex-grow-1" id="frontierSummary">Loading...</p>
+            <div class="btn-group btn-group-sm flex-shrink-0">
+              <button class="btn btn-outline-warning d-none" id="frontierUndo" type="button" title="Restore the URLs removed by the last bulk drop">Undo last drop</button>
+              <button class="btn btn-outline-secondary d-none" id="frontierForget" type="button" title="Forget the last bulk drop without changing the frontier">Forget drop</button>
+            </div>
           </div>
           <p id="frontierError" class="text-danger small mb-2 d-none"></p>
           <div id="frontierHosts" class="mb-3"></div>
@@ -296,6 +299,7 @@
     const frontierItems = document.getElementById('frontierItems');
     const frontierEmpty = document.getElementById('frontierEmpty');
     const frontierUndo = document.getElementById('frontierUndo');
+    const frontierForget = document.getElementById('frontierForget');
 
     function showFrontierError(message) {
       frontierError.textContent = message;
@@ -310,12 +314,13 @@
         frontierSummary.textContent =
           data.queued + ' queued, ' + data.retrying + ' retrying, ' + data.total + ' total';
 
-        if (data.lastDrop) {
+        const hasDrop = Boolean(data.lastDrop);
+        frontierUndo.classList.toggle('d-none', !hasDrop);
+        frontierForget.classList.toggle('d-none', !hasDrop);
+        if (hasDrop) {
           frontierUndo.textContent = 'Undo drop of ' + data.lastDrop.urls + ' from ' + data.lastDrop.host;
-          frontierUndo.classList.remove('d-none');
         } else {
           frontierUndo.textContent = 'Undo last drop';
-          frontierUndo.classList.add('d-none');
         }
 
         frontierHosts.textContent = '';
@@ -466,6 +471,27 @@
         showFrontierError('Connection failed');
       } finally {
         frontierUndo.disabled = false;
+      }
+    });
+
+    frontierForget.addEventListener('click', async () => {
+      if (!window.confirm('Forget the remembered drop? The skipped URLs stay skipped.')) {
+        return;
+      }
+      frontierError.classList.add('d-none');
+      frontierForget.disabled = true;
+      try {
+        const res = await fetch('/api/crawl/queue/undo/discard', {method: 'POST'});
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showFrontierError(err.error || 'The remembered drop could not be discarded.');
+          return;
+        }
+        loadFrontier();
+      } catch (e) {
+        showFrontierError('Connection failed');
+      } finally {
+        frontierForget.disabled = false;
       }
     });
 
