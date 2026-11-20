@@ -53,15 +53,16 @@ deduplicated by URL, and peer lists gossip automatically.
   retrying URL from that site, or prioritize all of its queued URLs, at once.
   The last bulk drop can be restored with one click, including any retry
   windows it held, or forgotten with another click when the drop should stay
-  in place. The undo batch is persisted, so it is still available after a
-  restart.
+  in place. The last single URL drop has its own undo and forget buttons, so
+  it is not consumed by a bulk action. Both undo records are persisted and
+  survive a restart.
 - **P2P mesh** - add peer nodes from the Settings modal; queries fan out
   concurrently with a hard 2 s time budget, results merge deduplicated by URL,
   peer lists gossip on contact, and peers track last-seen status.
-- **Persistence** - index, visited URLs, fingerprints, link counts, and the
-  last bulk frontier drop are stored in a single bbolt database and restored on
-  boot. The saved drop can be discarded without touching the frontier. Each
-  crawled page persists in one transaction.
+- **Persistence** - index, visited URLs, fingerprints, link counts, the last
+  bulk frontier drop, and the last single URL drop are stored in a single
+  bbolt database and restored on boot. A saved drop can be discarded without
+  touching the frontier. Each crawled page persists in one transaction.
 - **Web UI** - Bootstrap 5 dark/light theme, live crawl stats, seed-URL
   dialog, frontier inspector, peer management, paginated results (10 per page,
   100 max), 404 page. Templates and assets are embedded in the binary
@@ -231,6 +232,7 @@ Results are sorted by descending score, rounded to two decimals.
 | `fingerprints` | MD5 hex | `0x01` |
 | `meta` | `nextDocID` | 8-byte big endian next document ID |
 | `meta` | `lastDrop` | JSON batch from the last bulk frontier drop, kept for undo |
+| `meta` | `lastUrlDrop` | JSON entry from the last single URL drop, kept for undo |
 
 Everything is loaded back into memory on startup (`Engine.Restore`).
 
@@ -279,6 +281,8 @@ Full reference with request/response examples: [docs/API.md](docs/API.md).
 | `POST /api/crawl/queue/host/prioritize` | `{"host":"example.com"}` - move every queued URL for one host and its subdomains to the front. Retrying URLs are left in place. |
 | `POST /api/crawl/queue/undo` | Restore the URLs removed by the last bulk host drop, including their remaining retry windows. A batch can be undone once. |
 | `POST /api/crawl/queue/undo/discard` | Forget the remembered bulk drop without changing the frontier. The dropped URLs stay skipped. |
+| `POST /api/crawl/queue/undo/url` | Restore the URL removed by the last single drop, keeping its depth and retry window. |
+| `POST /api/crawl/queue/undo/url/discard` | Forget the remembered single URL drop without changing the frontier. |
 | `POST /api/crawl` | `{"url":"https://..."}` - seed a URL, returns `202` with the normalized URL. |
 | `POST /api/crawl/pause` | Stop the workers from picking up new URLs. |
 | `POST /api/crawl/resume` | Let the workers pick up URLs again. |
@@ -326,11 +330,11 @@ The test suite covers URL normalization, crawl exclusions (global and per host),
 robots rule precedence and crawl-delay parsing, per-host and per-page crawl
 budgets, retry requeueing and backoff jitter, queue clearing, dropping and
 prioritizing a single frontier URL or every URL for one host, undoing or
-discarding a bulk drop and restoring it across a restart, text and link
-extraction, tokenizing, rate limiting, the private-address guard, trie
-concurrency, index bookkeeping, prefix lookups, ranking and suggestions, batch
-persistence, result merging,
-document export (JSON and streaming NDJSON), and peer URL handling.
+discarding a bulk drop or a single URL drop and restoring both across a restart,
+text and link extraction, tokenizing, rate limiting, the private-address guard,
+trie concurrency, index bookkeeping, prefix lookups, ranking and suggestions,
+batch persistence, result merging, document export (JSON and streaming NDJSON),
+and peer URL handling.
 
 ## Known issues
 
@@ -360,8 +364,9 @@ Things that are still wrong or missing after the current round of fixes:
    results.
 8. **The crawl frontier is not persisted.** Visited URLs survive restarts, but
    links that were queued and not yet processed are rediscovered on the next
-   crawl of their parent. The last bulk frontier drop is the exception: its
-   batch is stored so the undo action still works after a restart.
+   crawl of their parent. The last bulk drop and the last single URL drop are
+   the exceptions: their records are stored so either undo still works after a
+   restart.
 9. **No charset handling.** Pages that are not UTF-8 will be indexed with
    mangled bytes.
 10. **Link discovery can drop URLs under load.** The frontier is a fixed-size

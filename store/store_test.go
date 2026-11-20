@@ -191,6 +191,60 @@ func TestLastDropRoundtrip(t *testing.T) {
 	}
 }
 
+func TestLastURLDropRoundtrip(t *testing.T) {
+	s := openTestStore(t)
+
+	if data, err := s.LoadLastURLDrop(); err != nil || data != nil {
+		t.Fatalf("LoadLastURLDrop on a new store = %q, %v; want nil", data, err)
+	}
+
+	drop := map[string]interface{}{"url": "https://example.com/a"}
+	if err := s.SaveLastURLDrop(drop); err != nil {
+		t.Fatalf("SaveLastURLDrop: %v", err)
+	}
+
+	data, err := s.LoadLastURLDrop()
+	if err != nil {
+		t.Fatalf("LoadLastURLDrop: %v", err)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("decode last URL drop: %v", err)
+	}
+	if got["url"] != "https://example.com/a" {
+		t.Errorf("last URL drop = %v, want https://example.com/a", got["url"])
+	}
+
+	if err := s.ClearLastURLDrop(); err != nil {
+		t.Fatalf("ClearLastURLDrop: %v", err)
+	}
+	if data, err := s.LoadLastURLDrop(); err != nil || data != nil {
+		t.Errorf("LoadLastURLDrop after clear = %q, %v; want nil", data, err)
+	}
+	if err := s.ClearLastURLDrop(); err != nil {
+		t.Fatalf("ClearLastURLDrop on an empty slot: %v", err)
+	}
+}
+
+func TestLastDropsUseSeparateSlots(t *testing.T) {
+	s := openTestStore(t)
+
+	if err := s.SaveLastDrop(map[string]string{"host": "example.com"}); err != nil {
+		t.Fatalf("SaveLastDrop: %v", err)
+	}
+	if err := s.SaveLastURLDrop(map[string]string{"url": "https://example.com/a"}); err != nil {
+		t.Fatalf("SaveLastURLDrop: %v", err)
+	}
+	if err := s.ClearLastURLDrop(); err != nil {
+		t.Fatalf("ClearLastURLDrop: %v", err)
+	}
+
+	data, err := s.LoadLastDrop()
+	if err != nil || data == nil || string(data) != `{"host":"example.com"}` {
+		t.Errorf("last bulk drop after clearing the URL drop = %q, %v", data, err)
+	}
+}
+
 func TestVisitedAndFingerprints(t *testing.T) {
 	s := openTestStore(t)
 

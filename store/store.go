@@ -275,21 +275,50 @@ func (s *Store) AllHostCounts(fn func(host string, count int) error) error {
 // SaveLastDrop stores the bulk frontier drop that can still be undone, so the
 // batch survives a restart. The caller owns the shape of the JSON payload.
 func (s *Store) SaveLastDrop(batch interface{}) error {
-	data, err := json.Marshal(batch)
-	if err != nil {
-		return err
-	}
-	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket([]byte("meta")).Put([]byte("lastDrop"), data)
-	})
+	return s.saveMeta("lastDrop", batch)
 }
 
 // LoadLastDrop returns the persisted bulk frontier drop, or nil when there is
 // nothing to restore.
 func (s *Store) LoadLastDrop() ([]byte, error) {
+	return s.loadMeta("lastDrop")
+}
+
+// ClearLastDrop forgets the persisted bulk frontier drop.
+func (s *Store) ClearLastDrop() error {
+	return s.clearMeta("lastDrop")
+}
+
+// SaveLastURLDrop stores the most recent single URL drop that can be undone.
+func (s *Store) SaveLastURLDrop(drop interface{}) error {
+	return s.saveMeta("lastUrlDrop", drop)
+}
+
+// LoadLastURLDrop returns the persisted single URL drop, or nil when there is
+// nothing to restore.
+func (s *Store) LoadLastURLDrop() ([]byte, error) {
+	return s.loadMeta("lastUrlDrop")
+}
+
+// ClearLastURLDrop forgets the persisted single URL drop.
+func (s *Store) ClearLastURLDrop() error {
+	return s.clearMeta("lastUrlDrop")
+}
+
+func (s *Store) saveMeta(key string, value interface{}) error {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return s.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket([]byte("meta")).Put([]byte(key), data)
+	})
+}
+
+func (s *Store) loadMeta(key string) ([]byte, error) {
 	var data []byte
 	err := s.db.View(func(tx *bolt.Tx) error {
-		if v := tx.Bucket([]byte("meta")).Get([]byte("lastDrop")); v != nil {
+		if v := tx.Bucket([]byte("meta")).Get([]byte(key)); v != nil {
 			data = append([]byte(nil), v...)
 		}
 		return nil
@@ -297,9 +326,8 @@ func (s *Store) LoadLastDrop() ([]byte, error) {
 	return data, err
 }
 
-// ClearLastDrop forgets the persisted bulk frontier drop.
-func (s *Store) ClearLastDrop() error {
+func (s *Store) clearMeta(key string) error {
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket([]byte("meta")).Delete([]byte("lastDrop"))
+		return tx.Bucket([]byte("meta")).Delete([]byte(key))
 	})
 }

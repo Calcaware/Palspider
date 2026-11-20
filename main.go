@@ -147,6 +147,8 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("POST /api/crawl/queue/host/prioritize", handleAPICrawlQueueHostPrioritize(e))
 	mux.HandleFunc("POST /api/crawl/queue/undo", handleAPICrawlQueueUndo(e))
 	mux.HandleFunc("POST /api/crawl/queue/undo/discard", handleAPICrawlQueueUndoDiscard(e))
+	mux.HandleFunc("POST /api/crawl/queue/undo/url", handleAPICrawlQueueUndoURL(e))
+	mux.HandleFunc("POST /api/crawl/queue/undo/url/discard", handleAPICrawlQueueUndoURLDiscard(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
 	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
 	mux.HandleFunc("POST /api/crawl/resume", handleAPICrawlResume(e))
@@ -814,6 +816,33 @@ func handleAPICrawlQueueUndoDiscard(e *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !e.DiscardLastDrop() {
 			writeJSONError(w, http.StatusBadRequest, "no dropped batch to discard")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "discarded": true})
+	}
+}
+
+// handleAPICrawlQueueUndoURL restores the URL removed by the last single
+// frontier drop. Like the bulk undo, a drop can be restored once.
+func handleAPICrawlQueueUndoURL(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		rawURL, restored := e.UndoDropURL()
+		if rawURL == "" {
+			writeJSONError(w, http.StatusBadRequest, "no dropped URL to restore")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "ok", "url": rawURL, "restored": restored,
+		})
+	}
+}
+
+// handleAPICrawlQueueUndoURLDiscard forgets the remembered single drop so it
+// can no longer be restored. The URL stays dropped.
+func handleAPICrawlQueueUndoURLDiscard(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !e.DiscardLastURLDrop() {
+			writeJSONError(w, http.StatusBadRequest, "no dropped URL to discard")
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]interface{}{"status": "ok", "discarded": true})

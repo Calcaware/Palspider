@@ -108,7 +108,9 @@
           <div class="d-flex align-items-center gap-2 mb-2">
             <p class="small text-secondary mb-0 flex-grow-1" id="frontierSummary">Loading...</p>
             <div class="btn-group btn-group-sm flex-shrink-0">
+              <button class="btn btn-outline-warning d-none" id="frontierUndoUrl" type="button" title="Restore the URL removed by the last single drop">Undo last URL</button>
               <button class="btn btn-outline-warning d-none" id="frontierUndo" type="button" title="Restore the URLs removed by the last bulk drop">Undo last drop</button>
+              <button class="btn btn-outline-secondary d-none" id="frontierForgetUrl" type="button" title="Forget the last single URL drop without changing the frontier">Forget URL</button>
               <button class="btn btn-outline-secondary d-none" id="frontierForget" type="button" title="Forget the last bulk drop without changing the frontier">Forget drop</button>
             </div>
           </div>
@@ -300,6 +302,8 @@
     const frontierEmpty = document.getElementById('frontierEmpty');
     const frontierUndo = document.getElementById('frontierUndo');
     const frontierForget = document.getElementById('frontierForget');
+    const frontierUndoUrl = document.getElementById('frontierUndoUrl');
+    const frontierForgetUrl = document.getElementById('frontierForgetUrl');
 
     function showFrontierError(message) {
       frontierError.textContent = message;
@@ -321,6 +325,16 @@
           frontierUndo.textContent = 'Undo drop of ' + data.lastDrop.urls + ' from ' + data.lastDrop.host;
         } else {
           frontierUndo.textContent = 'Undo last drop';
+        }
+
+        const hasUrlDrop = Boolean(data.lastUrlDrop);
+        frontierUndoUrl.classList.toggle('d-none', !hasUrlDrop);
+        frontierForgetUrl.classList.toggle('d-none', !hasUrlDrop);
+        if (hasUrlDrop) {
+          const dropped = data.lastUrlDrop.url;
+          frontierUndoUrl.textContent = 'Undo URL ' + (dropped.length > 30 ? dropped.slice(0, 27) + '...' : dropped);
+        } else {
+          frontierUndoUrl.textContent = 'Undo last URL';
         }
 
         frontierHosts.textContent = '';
@@ -492,6 +506,45 @@
         showFrontierError('Connection failed');
       } finally {
         frontierForget.disabled = false;
+      }
+    });
+
+    frontierUndoUrl.addEventListener('click', async () => {
+      frontierError.classList.add('d-none');
+      frontierUndoUrl.disabled = true;
+      try {
+        const res = await fetch('/api/crawl/queue/undo/url', {method: 'POST'});
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showFrontierError(err.error || 'The dropped URL could not be restored.');
+          return;
+        }
+        loadFrontier();
+      } catch (e) {
+        showFrontierError('Connection failed');
+      } finally {
+        frontierUndoUrl.disabled = false;
+      }
+    });
+
+    frontierForgetUrl.addEventListener('click', async () => {
+      if (!window.confirm('Forget the dropped URL? It stays skipped.')) {
+        return;
+      }
+      frontierError.classList.add('d-none');
+      frontierForgetUrl.disabled = true;
+      try {
+        const res = await fetch('/api/crawl/queue/undo/url/discard', {method: 'POST'});
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showFrontierError(err.error || 'The dropped URL could not be discarded.');
+          return;
+        }
+        loadFrontier();
+      } catch (e) {
+        showFrontierError('Connection failed');
+      } finally {
+        frontierForgetUrl.disabled = false;
       }
     });
 

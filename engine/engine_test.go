@@ -207,6 +207,235 @@ func TestDropURLReleasesRetrySlot(t *testing.T) {
 	}
 }
 
+func TestUndoDropURLRestoresQueuedURL(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	dropped := "https://example.com/a"
+	e.Seed(dropped)
+	e.Seed("https://other.example.org/c")
+
+	if !e.DropURL(dropped) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+	info := e.LastURLDropInfo()
+	if info == nil || info.URL != dropped || info.At == "" {
+		t.Fatalf("last URL drop = %+v, want the dropped URL and a timestamp", info)
+	}
+	if status := e.CrawlStatus(); status.LastURLDrop == nil || status.LastURLDrop.URL != dropped {
+		t.Errorf("crawl status last URL drop = %+v, want the pending URL", status.LastURLDrop)
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.LastURLDrop == nil || snap.LastURLDrop.URL != dropped {
+		t.Errorf("queue last URL drop = %+v, want the pending URL", snap.LastURLDrop)
+	}
+
+	gotURL, restored := e.UndoDropURL()
+	if gotURL != dropped || !restored {
+		t.Fatalf("UndoDropURL = %q %v, want %q and true", gotURL, restored, dropped)
+	}
+	if e.LastURLDropInfo() != nil {
+		t.Error("the last URL drop is still available after it was undone")
+	}
+
+	e.mu.Lock()
+	_, visited := e.visited[dropped]
+	depth, pending := e.pending[dropped]
+	_, otherPending := e.pending["https://other.example.org/c"]
+	e.mu.Unlock()
+	if visited || !pending {
+		t.Errorf("restored URL visited %v pending %v, want false and true", visited, pending)
+	}
+	if depth != 0 {
+		t.Errorf("restored depth = %d, want 0", depth)
+	}
+	if !otherPending {
+		t.Error("undoing one URL removed a different URL from the frontier")
+	}
+	item := <-e.urlChan
+	if item.url != dropped {
+		t.Errorf("restored queue item = %q, want %q", item.url, dropped)
+	}
+
+	if gotURL, restored := e.UndoDropURL(); gotURL != "" || restored {
+		t.Errorf("second UndoDropURL = %q %v, want nothing left to restore", gotURL, restored)
+	}
+}
+
+func TestUndoDropURLRestoresRetryWindow(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/broken"
+	e.scheduleRetry(rawURL, 2, errors.New("temporary network failure"))
+	<-e.urlChan
+
+	if !e.DropURL(rawURL) {
+		t.Fatal("DropURL returned false for a retrying URL")
+	}
+	if gotURL, restored := e.UndoDropURL(); gotURL != rawURL || !restored {
+		t.Fatalf("UndoDropURL = %q %v, want %q and true", gotURL, restored, rawURL)
+	}
+
+	e.mu.Lock()
+	at, retrying := e.retryAt[rawURL]
+	slots := e.hostRetries["example.com"]
+	count := e.retryCounts[rawURL]
+	depth := e.pending[rawURL]
+	e.mu.Unlock()
+	if !retrying || !at.After(time.Now()) {
+		t.Errorf("restored retry window = %v (set %v), want a future window", at, retrying)
+	}
+	if slots != 1 {
+		t.Errorf("host retry slots = %d, want the restored retry to hold one", slots)
+	}
+	if count != 1 {
+		t.Errorf("retry count = %d, want the earlier attempt to be kept", count)
+	}
+	if depth != 2 {
+		t.Errorf("restored depth = %d, want 2", depth)
+	}
+	if len(e.urlChan) != 1 {
+		t.Errorf("queue = %d items, want the restored retry to be queued", len(e.urlChan))
+	}
+}
+
+func TestUndoDropURLReportsURLAlreadyRestored(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/a"
+	e.Seed(rawURL)
+	if !e.DropURL(rawURL) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+	if !e.Requeue(rawURL) {
+		t.Fatal("Requeue failed for the dropped URL")
+	}
+
+	gotURL, restored := e.UndoDropURL()
+	if gotURL != rawURL || restored {
+		t.Fatalf("UndoDropURL = %q %v, want %q and false", gotURL, restored, rawURL)
+	}
+	if e.LastURLDropInfo() != nil {
+		t.Error("the empty undo left a drop behind")
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 1 || snap.Items[0].URL != rawURL {
+		t.Errorf("frontier after an empty undo = %+v, want one queued URL", snap)
+	}
+}
+
+func TestClearQueueClearsLastURLDrop(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.Seed("https://example.com/a")
+	if !e.DropURL("https://example.com/a") {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+
+	e.ClearQueue()
+	if e.LastURLDropInfo() != nil {
+		t.Error("clearing the queue kept a single URL drop that could still be undone")
+	}
+	if gotURL, restored := e.UndoDropURL(); gotURL != "" || restored {
+		t.Errorf("UndoDropURL after a clear = %q %v, want nothing", gotURL, restored)
+	}
+}
+
+func TestDiscardLastURLDropLeavesFrontierAlone(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	rawURL := "https://example.com/a"
+	e.Seed(rawURL)
+	e.Seed("https://other.example.org/c")
+	if !e.DropURL(rawURL) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+
+	if !e.DiscardLastURLDrop() {
+		t.Fatal("DiscardLastURLDrop reported no drop to discard")
+	}
+	if e.DiscardLastURLDrop() {
+		t.Error("DiscardLastURLDrop succeeded twice")
+	}
+	if info := e.LastURLDropInfo(); info != nil {
+		t.Errorf("last URL drop = %+v, want it discarded", info)
+	}
+	if status := e.CrawlStatus(); status.LastURLDrop != nil {
+		t.Errorf("crawl status last URL drop = %+v, want no pending drop", status.LastURLDrop)
+	}
+
+	snap := e.QueueSnapshot("", 0, 0)
+	if snap.Total != 1 || snap.LastURLDrop != nil || len(snap.Items) != 1 ||
+		snap.Items[0].URL != "https://other.example.org/c" {
+		t.Errorf("frontier after discard = %+v, want only the other host and no drop", snap)
+	}
+	e.mu.Lock()
+	_, visited := e.visited[rawURL]
+	_, pending := e.pending[rawURL]
+	e.mu.Unlock()
+	if !visited || pending {
+		t.Errorf("discarded URL visited %v pending %v, want visited and not pending", visited, pending)
+	}
+	if gotURL, restored := e.UndoDropURL(); gotURL != "" || restored {
+		t.Errorf("UndoDropURL after discard = %q %v, want nothing", gotURL, restored)
+	}
+}
+
+func TestUndoDropURLSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "engine.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	e := New(1, 10, 0, st)
+	rawURL := "https://example.com/a"
+	e.Seed(rawURL)
+	if !e.DropURL(rawURL) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+
+	again := New(1, 10, 0, st)
+	if err := again.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	info := again.LastURLDropInfo()
+	if info == nil || info.URL != rawURL {
+		t.Fatalf("last URL drop after restart = %+v, want %q", info, rawURL)
+	}
+
+	gotURL, restored := again.UndoDropURL()
+	if gotURL != rawURL || !restored {
+		t.Fatalf("UndoDropURL after restart = %q %v, want %q and true", gotURL, restored, rawURL)
+	}
+	again.mu.Lock()
+	_, visited := again.visited[rawURL]
+	_, pending := again.pending[rawURL]
+	again.mu.Unlock()
+	if visited || !pending {
+		t.Errorf("restored URL visited %v pending %v, want false and true", visited, pending)
+	}
+	if len(again.urlChan) != 1 {
+		t.Errorf("queue after restart undo = %d items, want 1", len(again.urlChan))
+	}
+
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store after undo: %v", err)
+	}
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store after undo: %v", err)
+	}
+	defer st.Close()
+	third := New(1, 10, 0, st)
+	if err := third.Restore(); err != nil {
+		t.Fatalf("Restore after undo: %v", err)
+	}
+	if info := third.LastURLDropInfo(); info != nil {
+		t.Errorf("last URL drop came back after a second restart: %+v", info)
+	}
+}
+
 func TestPrioritizeURLFrontLoadsQueuedCopy(t *testing.T) {
 	e := New(1, 10, 0, nil)
 	e.Seed("https://example.com/first")

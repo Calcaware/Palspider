@@ -311,7 +311,9 @@ Crawl queue snapshot. `GET /api/crawl` is an alias for `GET /crawl-status`.
   "retryQueues": {"example.com": 1},
   "retries": [
     {"url": "https://example.com/broken", "host": "example.com", "retryAt": "2026-10-28T09:12:05Z", "inSeconds": 3480}
-  ]
+  ],
+  "lastDrop": {"host": "example.org", "urls": 12, "at": "2026-10-28T08:15:00Z"},
+  "lastUrlDrop": {"url": "https://example.net/docs", "at": "2026-10-28T08:16:00Z"}
 }
 ```
 
@@ -322,9 +324,11 @@ is non-zero. `retrying` counts the URLs parked on a retry window,
 host to the number of retries it currently holds, and `retries` lists those
 parked URLs with their retry time. The retry fields are omitted when no URL is
 waiting on a retry. `lastDrop` is present when a bulk host drop can still be
-undone, with the host, URL count, and RFC 3339 time of the drop. The batch is
-persisted, so the undo survives a restart and can also be discarded through
-`POST /api/crawl/queue/undo/discard`.
+undone, with the host, URL count, and RFC 3339 time of the drop. `lastUrlDrop`
+holds the URL and RFC 3339 time of the most recent single drop that can still
+be undone. Both records are persisted, so the undos survive a restart and can
+also be discarded through `POST /api/crawl/queue/undo/discard` and
+`POST /api/crawl/queue/undo/url/discard`.
 
 This is what the web UI polls every three seconds.
 
@@ -354,6 +358,7 @@ Query parameters:
     "example.com": {"queued": 1, "retrying": 1}
   },
   "lastDrop": {"host": "example.org", "urls": 12, "at": "2026-10-28T08:15:00Z"},
+  "lastUrlDrop": {"url": "https://example.net/docs", "at": "2026-10-28T08:16:00Z"},
   "items": [
     {"url": "https://example.com/next", "host": "example.com", "depth": 1, "status": "queued"},
     {"url": "https://example.com/broken", "host": "example.com", "depth": 2, "status": "retrying", "retryAt": "2026-10-28T09:12:05Z", "inSeconds": 3480}
@@ -368,10 +373,12 @@ host even when the returned page is smaller than the frontier. A `retrying`
 item also carries `retryAt` (RFC 3339) and `inSeconds`, which counts down to
 the retry and is omitted once the window has opened. Items that a worker is
 currently fetching are not listed. `lastDrop` describes the most recent
-non-empty bulk host drop that can still be undone, and is omitted when there is
-nothing to restore. The batch is persisted, so it is still reported after a
-restart. The `at` field is the RFC 3339 time of the drop. Use
-`POST /api/crawl/queue/undo/discard` to forget it without changing the frontier.
+non-empty bulk host drop that can still be undone, while `lastUrlDrop` holds the
+most recent single URL drop. Both are omitted when there is nothing to restore,
+and both are persisted so they are still reported after a restart. Their `at`
+fields are RFC 3339 times. Use `POST /api/crawl/queue/undo/discard` or
+`POST /api/crawl/queue/undo/url/discard` to forget one without changing the
+frontier.
 
 Pagination metadata is also reported in the response headers:
 `X-Palspider-Count`, `X-Palspider-Offset`, `X-Palspider-Limit`, and
@@ -386,7 +393,9 @@ curl 'http://localhost:3000/api/crawl/queue?host=example.com&limit=20'
 Remove one URL from the frontier and skip it. The URL is marked visited, so a
 link to the same page is not queued again until `POST /api/crawl/requeue`
 resets it. A URL that is waiting on a retry is dropped as well, and its
-per-host retry slot is released.
+per-host retry slot is released. The drop is remembered as the last single URL
+drop, so `POST /api/crawl/queue/undo/url` can put it back. A bulk host drop does
+not consume this record.
 
 Request body:
 
@@ -532,6 +541,53 @@ database as well, so a restart does not bring it back.
 
 ```sh
 curl -X POST http://localhost:3000/api/crawl/queue/undo/discard
+```
+
+### `POST /api/crawl/queue/undo/url`
+
+Restore the URL removed by the most recent `POST /api/crawl/queue/drop`. The
+endpoint takes no body. The URL is removed from the visited set and put back on
+the frontier at its previous depth. A URL that was waiting on a retry keeps the
+remaining part of its window and its attempt count, so a host that is still
+down is not hit early. A bulk drop is tracked separately and is not affected by
+this endpoint.
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","url":"https://example.org/docs","restored":true}
+```
+
+`restored` is `false` when the URL was already queued again in the meantime; the
+request still succeeds and the saved drop is consumed. With no single drop to
+restore the response is `400` with `{"error":"no dropped URL to restore"}`. A
+drop can be undone once and the record is stored in the database, so the undo
+still works after a restart.
+
+```sh
+curl -X POST http://localhost:3000/api/crawl/queue/undo/url
+```
+
+### `POST /api/crawl/queue/undo/url/discard`
+
+Forget the remembered single URL drop so it can no longer be undone. The
+endpoint takes no body and leaves the frontier untouched. The URL stays visited
+and skipped, so a later link to it does not queue it again. Use
+`POST /api/crawl/requeue` or `POST /api/crawl/clear` when it should be crawled
+again.
+
+Success (`200 OK`):
+
+```json
+{"status":"ok","discarded":true}
+```
+
+With no drop to discard the response is `400` with
+`{"error":"no dropped URL to discard"}`. The saved record is removed from the
+database as well, so a restart does not bring it back.
+
+```sh
+curl -X POST http://localhost:3000/api/crawl/queue/undo/url/discard
 ```
 
 ### `POST /api/crawl`
