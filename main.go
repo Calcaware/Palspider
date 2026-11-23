@@ -148,6 +148,7 @@ func newMux(e *engine.Engine, tmpl *template.Template) http.Handler {
 	mux.HandleFunc("POST /api/crawl/queue/undo", handleAPICrawlQueueUndo(e))
 	mux.HandleFunc("POST /api/crawl/queue/undo/discard", handleAPICrawlQueueUndoDiscard(e))
 	mux.HandleFunc("POST /api/crawl/queue/undo/url", handleAPICrawlQueueUndoURL(e))
+	mux.HandleFunc("POST /api/crawl/queue/undo/url/select", handleAPICrawlQueueUndoURLByURL(e))
 	mux.HandleFunc("POST /api/crawl/queue/undo/url/discard", handleAPICrawlQueueUndoURLDiscard(e))
 	mux.HandleFunc("POST /api/crawl", handleAPICrawl(e))
 	mux.HandleFunc("POST /api/crawl/pause", handleAPICrawlPause(e))
@@ -837,8 +838,37 @@ func handleAPICrawlQueueUndoURL(e *engine.Engine) http.HandlerFunc {
 	}
 }
 
-// handleAPICrawlQueueUndoURLDiscard forgets the remembered single drop so it
-// can no longer be restored. The URL stays dropped.
+// handleAPICrawlQueueUndoURLByURL restores one URL from the recent single
+// drop history, rather than only the newest drop. The URL is normalized the
+// same way the crawler normalizes seeds and discovered links.
+func handleAPICrawlQueueUndoURLByURL(e *engine.Engine) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+		var body struct {
+			URL string `json:"url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid JSON")
+			return
+		}
+		rawURL := strings.TrimSpace(body.URL)
+		if rawURL == "" {
+			writeJSONError(w, http.StatusBadRequest, "url required")
+			return
+		}
+		rawURL, restored, found := e.UndoDropURLByURL(rawURL)
+		if !found {
+			writeJSONError(w, http.StatusBadRequest, "dropped URL not found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"status": "ok", "url": rawURL, "restored": restored,
+		})
+	}
+}
+
+// handleAPICrawlQueueUndoURLDiscard forgets the newest single drop so it can
+// no longer be restored. Older drops are left alone and the URL stays dropped.
 func handleAPICrawlQueueUndoURLDiscard(e *engine.Engine) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !e.DiscardLastURLDrop() {

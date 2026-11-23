@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -315,6 +316,251 @@ func TestUndoDropURLReportsURLAlreadyRestored(t *testing.T) {
 	}
 	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 1 || snap.Items[0].URL != rawURL {
 		t.Errorf("frontier after an empty undo = %+v, want one queued URL", snap)
+	}
+}
+
+func TestUndoDropURLByURLRestoresSelectedDrop(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	first := "https://example.com/a"
+	second := "https://example.com/b"
+	other := "https://other.example.org/c"
+	e.Seed(first)
+	e.Seed(second)
+	e.Seed(other)
+
+	if !e.DropURL(first) || !e.DropURL(second) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+	drops := e.URLDropsInfo()
+	if len(drops) != 2 || drops[0].URL != second || drops[1].URL != first ||
+		drops[0].At == "" || drops[1].At == "" {
+		t.Fatalf("URL drops = %+v, want %q then %q with timestamps", drops, second, first)
+	}
+	if snap := e.QueueSnapshot("", 0, 0); len(snap.URLDrops) != 2 ||
+		snap.URLDrops[0].URL != second {
+		t.Fatalf("queue URL drops = %+v, want the newest drop first", snap.URLDrops)
+	}
+
+	gotURL, restored, found := e.UndoDropURLByURL(second)
+	if gotURL != second || !restored || !found {
+		t.Fatalf("selected undo = %q %v %v, want %q and true", gotURL, restored, found, second)
+	}
+	if info := e.LastURLDropInfo(); info == nil || info.URL != first {
+		t.Fatalf("last URL drop after a selected undo = %+v, want %q", info, first)
+	}
+	if drops := e.URLDropsInfo(); len(drops) != 1 || drops[0].URL != first {
+		t.Fatalf("URL drops after a selected undo = %+v, want only %q", drops, first)
+	}
+	queued := map[string]int{}
+	for len(e.urlChan) > 0 {
+		queued[(<-e.urlChan).url]++
+	}
+	if queued[other] != 1 || queued[second] != 2 || queued[first] != 1 {
+		t.Errorf("queue after a selected undo = %v, want one copy of %q and %q plus the restored %q",
+			queued, first, other, second)
+	}
+
+	gotURL, restored, found = e.UndoDropURLByURL(first)
+	if gotURL != first || !restored || !found {
+		t.Fatalf("undo of the older drop = %q %v %v, want %q and true", gotURL, restored, found, first)
+	}
+	if e.LastURLDropInfo() != nil {
+		t.Error("the last drop is still available after every drop was restored")
+	}
+	if item := <-e.urlChan; item.url != first {
+		t.Errorf("last queued item = %q, want %q", item.url, first)
+	}
+}
+
+func TestUndoDropURLByURLRejectsUnknownURL(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	dropped := "https://example.com/a"
+	missing := "https://example.com/missing"
+	e.Seed(dropped)
+	if !e.DropURL(dropped) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+
+	gotURL, restored, found := e.UndoDropURLByURL(missing)
+	if gotURL != missing || restored || found {
+		t.Fatalf("unknown selected undo = %q %v %v, want %q false false",
+			gotURL, restored, found, missing)
+	}
+	if info := e.LastURLDropInfo(); info == nil || info.URL != dropped {
+		t.Fatalf("last URL drop = %+v, want the unknown undo to leave it alone", info)
+	}
+	if snap := e.QueueSnapshot("", 0, 0); snap.Total != 0 {
+		t.Errorf("frontier total = %d, want an unknown undo to leave it empty", snap.Total)
+	}
+}
+
+func TestUndoDropURLKeepsHistoryWhenQueueIsFull(t *testing.T) {
+	e := New(1, 10, 0, nil)
+	e.urlChan = make(chan crawlItem, 2)
+	first := "https://example.com/a"
+	other := "https://example.com/b"
+	e.Seed(first)
+	e.Seed(other)
+	if !e.DropURL(first) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+	if len(e.urlChan) != cap(e.urlChan) {
+		t.Fatalf("queue = %d items, want it full before the undo", len(e.urlChan))
+	}
+
+	gotURL, restored := e.UndoDropURL()
+	if gotURL != first || restored {
+		t.Fatalf("undo with a full queue = %q %v, want %q and false", gotURL, restored, first)
+	}
+	if info := e.LastURLDropInfo(); info == nil || info.URL != first {
+		t.Fatalf("last URL drop after a full queue = %+v, want %q kept", info, first)
+	}
+	e.mu.Lock()
+	_, visited := e.visited[first]
+	_, pending := e.pending[first]
+	e.mu.Unlock()
+	if !visited || pending {
+		t.Errorf("URL after a full queue visited %v pending %v, want visited and not pending", visited, pending)
+	}
+
+	e.markDequeued(<-e.urlChan)
+	gotURL, restored = e.UndoDropURL()
+	if gotURL != first || !restored {
+		t.Fatalf("retry after a full queue = %q %v, want %q and true", gotURL, restored, first)
+	}
+}
+
+func TestURLDropHistoryIsBoundedAndKeepsNewestCopy(t *testing.T) {
+	var batch *droppedBatch
+	for i := 0; i <= maxURLDrops+4; i++ {
+		batch = prependURLDrop(batch, droppedURL{
+			url: fmt.Sprintf("https://example.com/%d", i),
+			at:  time.Now().Add(time.Duration(i) * time.Second),
+		})
+	}
+	if len(batch.items) != maxURLDrops {
+		t.Fatalf("history length = %d, want %d", len(batch.items), maxURLDrops)
+	}
+	newest := fmt.Sprintf("https://example.com/%d", maxURLDrops+4)
+	if batch.items[0].url != newest {
+		t.Errorf("newest drop = %q, want %q", batch.items[0].url, newest)
+	}
+
+	batch = prependURLDrop(batch, droppedURL{url: newest, at: time.Now().Add(time.Hour)})
+	if len(batch.items) != maxURLDrops || batch.items[0].url != newest {
+		t.Fatalf("history after a repeat drop = %+v, want %d entries with %q first",
+			batch.items, maxURLDrops, newest)
+	}
+	count := 0
+	for _, item := range batch.items {
+		if item.url == newest {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("repeat drop appears %d times, want once", count)
+	}
+}
+
+func TestUndoDropURLSelectedDropSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "engine.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	first := "https://example.com/a"
+	second := "https://example.com/b"
+	e := New(1, 10, 0, st)
+	e.Seed(first)
+	e.Seed(second)
+	if !e.DropURL(first) || !e.DropURL(second) {
+		t.Fatal("DropURL returned false for a queued URL")
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	again := New(1, 10, 0, st)
+	if err := again.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	drops := again.URLDropsInfo()
+	if len(drops) != 2 || drops[0].URL != second || drops[1].URL != first {
+		t.Fatalf("URL drops after restart = %+v, want %q then %q", drops, second, first)
+	}
+
+	gotURL, restored, found := again.UndoDropURLByURL("HTTPS://EXAMPLE.COM/b")
+	if gotURL != second || !restored || !found {
+		t.Fatalf("selected undo after restart = %q %v %v, want %q and true",
+			gotURL, restored, found, second)
+	}
+	if drops := again.URLDropsInfo(); len(drops) != 1 || drops[0].URL != first {
+		t.Fatalf("URL drops after a selected undo = %+v, want only %q", drops, first)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store after undo: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store after undo: %v", err)
+	}
+	defer st.Close()
+	third := New(1, 10, 0, st)
+	if err := third.Restore(); err != nil {
+		t.Fatalf("Restore after undo: %v", err)
+	}
+	drops = third.URLDropsInfo()
+	if len(drops) != 1 || drops[0].URL != first {
+		t.Fatalf("URL drops after a second restart = %+v, want only %q", drops, first)
+	}
+}
+
+func TestRestoreReadsLegacySingleURLDrop(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "engine.db")
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	legacy := json.RawMessage(`{"at":"2026-01-02T03:04:05Z","items":[{"url":"https://example.com/a","depth":2,"retryCount":1}]}`)
+	if err := st.SaveLastURLDrop(legacy); err != nil {
+		t.Fatalf("save legacy drop: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	st, err = store.Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	defer st.Close()
+	e := New(1, 10, 0, st)
+	if err := e.Restore(); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	info := e.LastURLDropInfo()
+	if info == nil || info.URL != "https://example.com/a" || info.At != "2026-01-02T03:04:05Z" {
+		t.Fatalf("legacy drop = %+v, want the saved URL and time", info)
+	}
+	if drops := e.URLDropsInfo(); len(drops) != 1 || drops[0].At != info.At {
+		t.Fatalf("legacy drop history = %+v, want one entry with the saved time", drops)
+	}
+
+	if gotURL, restored := e.UndoDropURL(); gotURL != info.URL || !restored {
+		t.Fatalf("undo of a legacy drop = %q %v, want %q and true", gotURL, restored, info.URL)
+	}
+	e.mu.Lock()
+	depth := e.pending[info.URL]
+	count := e.retryCounts[info.URL]
+	e.mu.Unlock()
+	if depth != 2 || count != 1 {
+		t.Errorf("restored legacy drop = depth %d retries %d, want 2 and 1", depth, count)
 	}
 }
 

@@ -46,6 +46,11 @@ const (
 	// asked the crawler to fetch next. It is small next to the main frontier
 	// because only interactive actions use it.
 	priorityQueueSize = 10000
+
+	// maxURLDrops is how many recent single URL drops stay available for an
+	// undo. Older drops are forgotten so neither the engine nor the database
+	// grows without bound as operators work through a messy crawl.
+	maxURLDrops = 100
 )
 
 // EnvRetryDelay names the variable that sets how long the crawler waits
@@ -192,6 +197,7 @@ type QueueSnapshot struct {
 	Hosts       map[string]QueueHost `json:"hosts"`
 	LastDrop    *DroppedBatch        `json:"lastDrop,omitempty"`
 	LastURLDrop *DroppedURL          `json:"lastUrlDrop,omitempty"`
+	URLDrops    []DroppedURL         `json:"urlDrops,omitempty"`
 	Items       []QueueItem          `json:"items"`
 }
 
@@ -204,9 +210,9 @@ type DroppedBatch struct {
 	At   string `json:"at"`
 }
 
-// DroppedURL describes the URL removed by the most recent single frontier
-// drop. Like DroppedBatch, it stays available until it is undone or the queue
-// is cleared, so an operator can restore it without a full requeue.
+// DroppedURL describes a URL removed by a single frontier drop. Recent drops
+// stay available until they are undone, discarded, or the queue is cleared,
+// so an operator can restore one without a full requeue.
 type DroppedURL struct {
 	URL string `json:"url"`
 	At  string `json:"at"`
@@ -217,6 +223,7 @@ type droppedURL struct {
 	depth      int
 	retryAt    time.Time
 	retryCount int
+	at         time.Time
 }
 
 type droppedBatch struct {
@@ -238,6 +245,7 @@ type persistedDropURL struct {
 	Depth      int       `json:"depth"`
 	RetryAt    time.Time `json:"retryAt,omitempty"`
 	RetryCount int       `json:"retryCount,omitempty"`
+	At         time.Time `json:"at,omitempty"`
 }
 
 func (b *droppedBatch) persistable() persistedDrop {
@@ -257,6 +265,31 @@ func (b *droppedBatch) persistable() persistedDrop {
 	return out
 }
 
+// persistableURLDrops writes the recent single drops with their own
+// timestamps. The bulk shape carries one time for the whole batch, so the
+// per-entry time is only set here. Older records have no per-entry time and
+// are restored with the batch time instead.
+func (b *droppedBatch) persistableURLDrops() persistedDrop {
+	out := persistedDrop{
+		At:    b.at,
+		Items: make([]persistedDropURL, 0, len(b.items)),
+	}
+	for _, entry := range b.items {
+		at := entry.at
+		if at.IsZero() {
+			at = b.at
+		}
+		out.Items = append(out.Items, persistedDropURL{
+			URL:        entry.url,
+			Depth:      entry.depth,
+			RetryAt:    entry.retryAt,
+			RetryCount: entry.retryCount,
+			At:         at,
+		})
+	}
+	return out
+}
+
 func restoreDroppedBatch(saved persistedDrop) *droppedBatch {
 	if len(saved.Items) == 0 {
 		return nil
@@ -267,13 +300,88 @@ func restoreDroppedBatch(saved persistedDrop) *droppedBatch {
 		items: make([]droppedURL, 0, len(saved.Items)),
 	}
 	for _, entry := range saved.Items {
+		at := entry.At
+		if at.IsZero() {
+			at = saved.At
+		}
 		batch.items = append(batch.items, droppedURL{
 			url:        entry.URL,
 			depth:      entry.Depth,
 			retryAt:    entry.RetryAt,
 			retryCount: entry.RetryCount,
+			at:         at,
 		})
 	}
+	return batch
+}
+
+// restoreURLDrops reads the single drop history in newest-first order. A
+// record written before the history existed has just one item without a
+// timestamp, which is still readable through restoreDroppedBatch.
+func restoreURLDrops(saved persistedDrop) *droppedBatch {
+	batch := restoreDroppedBatch(saved)
+	if batch == nil {
+		return nil
+	}
+	sort.SliceStable(batch.items, func(i, j int) bool {
+		return batch.items[i].at.After(batch.items[j].at)
+	})
+	items := make([]droppedURL, 0, len(batch.items))
+	seen := make(map[string]bool, len(batch.items))
+	for _, entry := range batch.items {
+		if seen[entry.url] {
+			continue
+		}
+		seen[entry.url] = true
+		items = append(items, entry)
+	}
+	if len(items) > maxURLDrops {
+		items = items[:maxURLDrops]
+	}
+	batch.items = items
+	if len(items) > 0 {
+		batch.at = items[0].at
+	}
+	return batch
+}
+
+// prependURLDrop remembers a fresh single drop. A URL that was dropped and
+// requeued earlier keeps only its newest record, so an undo never picks an
+// outdated depth or retry window for it.
+func prependURLDrop(batch *droppedBatch, entry droppedURL) *droppedBatch {
+	if batch == nil {
+		batch = &droppedBatch{}
+	}
+	items := make([]droppedURL, 0, len(batch.items)+1)
+	items = append(items, entry)
+	for _, old := range batch.items {
+		if old.url == entry.url {
+			continue
+		}
+		items = append(items, old)
+	}
+	if len(items) > maxURLDrops {
+		items = items[:maxURLDrops]
+	}
+	batch.items = items
+	batch.at = entry.at
+	return batch
+}
+
+// removeURLDropAt forgets one entry without disturbing the rest of the
+// history. The batch time follows the newest remaining entry.
+func removeURLDropAt(batch *droppedBatch, idx int) *droppedBatch {
+	if batch == nil || idx < 0 || idx >= len(batch.items) {
+		return batch
+	}
+	items := make([]droppedURL, 0, len(batch.items)-1)
+	items = append(items, batch.items[:idx]...)
+	items = append(items, batch.items[idx+1:]...)
+	if len(items) == 0 {
+		return nil
+	}
+	batch.items = items
+	batch.at = items[0].at
 	return batch
 }
 
@@ -292,6 +400,7 @@ type CrawlStatus struct {
 	Retries     []RetryStatus       `json:"retries,omitempty"`
 	LastDrop    *DroppedBatch       `json:"lastDrop,omitempty"`
 	LastURLDrop *DroppedURL         `json:"lastUrlDrop,omitempty"`
+	URLDrops    []DroppedURL        `json:"urlDrops,omitempty"`
 }
 
 // New creates an engine. maxDepth < 0 means unlimited crawl depth; maxPages
@@ -414,8 +523,10 @@ func (e *Engine) Restore() error {
 		}
 	}
 
-	// A single URL drop is kept in its own slot, so undoing it does not
-	// consume a bulk batch saved by a later host drop.
+	// Recent single URL drops are kept in their own slot, so undoing one does
+	// not consume a bulk batch saved by a later host drop. The list also
+	// survives a restart, including records written before the history was
+	// added.
 	savedURL, err := e.Store.LoadLastURLDrop()
 	if err != nil {
 		return err
@@ -425,7 +536,7 @@ func (e *Engine) Restore() error {
 		if err := json.Unmarshal(savedURL, &batch); err != nil {
 			return err
 		}
-		e.lastURLDrop = restoreDroppedBatch(batch)
+		e.lastURLDrop = restoreURLDrops(batch)
 		if e.lastURLDrop == nil {
 			if err := e.Store.ClearLastURLDrop(); err != nil {
 				return err
@@ -896,8 +1007,9 @@ func (e *Engine) ClearQueue() {
 // DropURL removes one URL from the crawl frontier and marks it visited, so
 // the same link is not queued again until Requeue resets it. A copy that is
 // already sitting in a worker channel is ignored when it is dequeued because
-// the URL is no longer pending. The drop is remembered so UndoDropURL can put
-// the URL back with its depth and any remaining retry window.
+// the URL is no longer pending. The drop is remembered with the other recent
+// single drops, so it can be selected for undo with its depth and any
+// remaining retry window.
 func (e *Engine) DropURL(rawURL string) bool {
 	normalized := crawler.NormalizeURL(rawURL)
 	e.mu.Lock()
@@ -906,7 +1018,7 @@ func (e *Engine) DropURL(rawURL string) bool {
 		e.mu.Unlock()
 		return false
 	}
-	entry := droppedURL{url: normalized, depth: depth, retryCount: e.retryCounts[normalized]}
+	entry := droppedURL{url: normalized, depth: depth, retryCount: e.retryCounts[normalized], at: time.Now()}
 	if at, retrying := e.retryAt[normalized]; retrying {
 		entry.retryAt = at
 		delete(e.retryAt, normalized)
@@ -915,7 +1027,7 @@ func (e *Engine) DropURL(rawURL string) bool {
 	delete(e.pending, normalized)
 	delete(e.retryCounts, normalized)
 	e.visited[normalized] = struct{}{}
-	e.lastURLDrop = &droppedBatch{at: time.Now(), items: []droppedURL{entry}}
+	e.lastURLDrop = prependURLDrop(e.lastURLDrop, entry)
 	e.saveLastURLDropLocked()
 	e.mu.Unlock()
 
@@ -1073,22 +1185,56 @@ func (e *Engine) UndoDropHost() (string, int) {
 }
 
 // UndoDropURL restores the URL removed by the most recent single frontier
-// drop. A URL that was waiting on a retry keeps the remaining part of its
-// window and its attempt count. The drop can be undone once; a URL that is
-// already back in the frontier is left alone and reported as not restored.
+// drop. Older drops are left alone; use UndoDropURLByURL to select one. A URL
+// that was waiting on a retry keeps the remaining part of its window and its
+// attempt count. A URL that is already back in the frontier is left alone and
+// reported as not restored.
 func (e *Engine) UndoDropURL() (string, bool) {
+	rawURL, restored, _ := e.undoURLDrop("", false)
+	return rawURL, restored
+}
+
+// UndoDropURLByURL restores a specific URL from the recent single drop
+// history. It returns the normalized URL, whether the URL was put back on the
+// frontier, and whether the URL was in the history at all. The third result
+// separates an unknown URL from one that was already queued again.
+func (e *Engine) UndoDropURLByURL(rawURL string) (string, bool, bool) {
+	return e.undoURLDrop(rawURL, true)
+}
+
+func (e *Engine) undoURLDrop(rawURL string, byURL bool) (string, bool, bool) {
+	// The plain undo has no URL to report when the history is empty. Only a
+	// selected undo echoes the URL back to its caller.
+	normalized := ""
+	if byURL {
+		normalized = crawler.NormalizeURL(rawURL)
+	}
 	e.mu.Lock()
+	defer e.mu.Unlock()
+
 	batch := e.lastURLDrop
 	if batch == nil || len(batch.items) == 0 {
-		e.mu.Unlock()
-		return "", false
+		return normalized, false, false
 	}
-	entry := batch.items[0]
-	e.lastURLDrop = nil
-	e.saveLastURLDropLocked()
+	idx := 0
+	if byURL {
+		found := false
+		for i, item := range batch.items {
+			if item.url == normalized {
+				idx = i
+				found = true
+				break
+			}
+		}
+		if !found {
+			return normalized, false, false
+		}
+	}
+	entry := batch.items[idx]
 	if _, pending := e.pending[entry.url]; pending {
-		e.mu.Unlock()
-		return entry.url, false
+		e.lastURLDrop = removeURLDropAt(batch, idx)
+		e.saveLastURLDropLocked()
+		return entry.url, false, true
 	}
 
 	// Clear the persisted visited mark before the URL becomes pending again.
@@ -1109,46 +1255,64 @@ func (e *Engine) UndoDropURL() (string, bool) {
 			e.hostRetries[host]++
 		}
 	}
-	e.mu.Unlock()
 
+	// The send is nonblocking, so the history stays protected by the same
+	// lock that guards the frontier. If the queue is full, keep both the
+	// drop record and the visited mark so the operator can retry the undo
+	// instead of losing the URL entirely.
 	if !e.enqueue(crawlItem{url: entry.url, depth: entry.depth}, 0) {
-		e.mu.Lock()
 		delete(e.pending, entry.url)
 		delete(e.retryCounts, entry.url)
 		if _, retrying := e.retryAt[entry.url]; retrying {
 			delete(e.retryAt, entry.url)
 			e.releaseHostRetryLocked(entry.url)
 		}
-		e.mu.Unlock()
-		return entry.url, false
+		e.visited[entry.url] = struct{}{}
+		if e.Store != nil {
+			if err := e.Store.MarkVisited(entry.url); err != nil {
+				log.Printf("undo URL drop rollback: %v", err)
+			}
+		}
+		return entry.url, false, true
 	}
-	return entry.url, true
+	e.lastURLDrop = removeURLDropAt(batch, idx)
+	e.saveLastURLDropLocked()
+	return entry.url, true, true
 }
 
-// DiscardLastURLDrop forgets the remembered single drop without touching the
-// frontier. The dropped URL stays visited and out of the queue. It reports
-// whether there was a drop to discard.
+// DiscardLastURLDrop forgets the newest single URL drop without touching the
+// frontier. Older drops remain available for a selected undo. The dropped URL
+// stays visited and out of the queue. It reports whether there was a drop to
+// discard.
 func (e *Engine) DiscardLastURLDrop() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.lastURLDrop == nil {
+	if e.lastURLDrop == nil || len(e.lastURLDrop.items) == 0 {
 		return false
 	}
-	e.lastURLDrop = nil
+	e.lastURLDrop = removeURLDropAt(e.lastURLDrop, 0)
 	e.saveLastURLDropLocked()
 	return true
 }
 
-// LastURLDropInfo describes the single drop that UndoDropURL would restore,
-// or nil when there is nothing to undo.
+// LastURLDropInfo describes the newest single drop that UndoDropURL would
+// restore, or nil when there is nothing to undo.
 func (e *Engine) LastURLDropInfo() *DroppedURL {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.lastURLDropInfoLocked()
 }
 
-// saveLastURLDropLocked writes the current single drop, or removes it when
-// there is nothing left to restore. The caller must hold e.mu.
+// URLDropsInfo lists the recent single drops in the order they were made,
+// newest first. Operators use it to pick one URL to restore.
+func (e *Engine) URLDropsInfo() []DroppedURL {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.urlDropsInfoLocked()
+}
+
+// saveLastURLDropLocked writes the current single drop history, or removes it
+// when there is nothing left to restore. The caller must hold e.mu.
 func (e *Engine) saveLastURLDropLocked() {
 	if e.Store == nil {
 		return
@@ -1157,21 +1321,37 @@ func (e *Engine) saveLastURLDropLocked() {
 	if e.lastURLDrop == nil {
 		err = e.Store.ClearLastURLDrop()
 	} else {
-		err = e.Store.SaveLastURLDrop(e.lastURLDrop.persistable())
+		err = e.Store.SaveLastURLDrop(e.lastURLDrop.persistableURLDrops())
 	}
 	if err != nil {
 		log.Printf("persist last URL drop: %v", err)
 	}
 }
 
-func (e *Engine) lastURLDropInfoLocked() *DroppedURL {
+func (e *Engine) urlDropsInfoLocked() []DroppedURL {
 	if e.lastURLDrop == nil || len(e.lastURLDrop.items) == 0 {
 		return nil
 	}
-	return &DroppedURL{
-		URL: e.lastURLDrop.items[0].url,
-		At:  e.lastURLDrop.at.Format(time.RFC3339),
+	out := make([]DroppedURL, 0, len(e.lastURLDrop.items))
+	for _, item := range e.lastURLDrop.items {
+		at := item.at
+		if at.IsZero() {
+			at = e.lastURLDrop.at
+		}
+		out = append(out, DroppedURL{
+			URL: item.url,
+			At:  at.Format(time.RFC3339),
+		})
 	}
+	return out
+}
+
+func (e *Engine) lastURLDropInfoLocked() *DroppedURL {
+	drops := e.urlDropsInfoLocked()
+	if len(drops) == 0 {
+		return nil
+	}
+	return &drops[0]
 }
 
 // DiscardLastDrop forgets the remembered bulk drop without touching the
@@ -1458,6 +1638,7 @@ func (e *Engine) CrawlStatus() CrawlStatus {
 	retryBudget := e.retryBudget
 	lastDrop := e.lastDropInfoLocked()
 	lastURLDrop := e.lastURLDropInfoLocked()
+	urlDrops := e.urlDropsInfoLocked()
 	e.mu.Unlock()
 	queueSize := atomic.LoadInt32(&e.queueSize)
 	active := atomic.LoadInt32(&e.active)
@@ -1476,6 +1657,7 @@ func (e *Engine) CrawlStatus() CrawlStatus {
 		Retries:     retries,
 		LastDrop:    lastDrop,
 		LastURLDrop: lastURLDrop,
+		URLDrops:    urlDrops,
 	}
 }
 
@@ -1523,6 +1705,7 @@ func (e *Engine) QueueSnapshot(host string, offset, limit int) QueueSnapshot {
 	}
 	lastDrop := e.lastDropInfoLocked()
 	lastURLDrop := e.lastURLDropInfoLocked()
+	urlDrops := e.urlDropsInfoLocked()
 	e.mu.Unlock()
 
 	sort.Slice(items, func(i, j int) bool {
@@ -1549,6 +1732,7 @@ func (e *Engine) QueueSnapshot(host string, offset, limit int) QueueSnapshot {
 		Hosts:       hosts,
 		LastDrop:    lastDrop,
 		LastURLDrop: lastURLDrop,
+		URLDrops:    urlDrops,
 		Items:       items,
 	}
 }

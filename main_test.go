@@ -923,6 +923,94 @@ func TestAPICrawlQueueURLUndo(t *testing.T) {
 	}
 }
 
+func TestAPICrawlQueueURLUndoByURL(t *testing.T) {
+	ts, e, done := newTestServerE(t)
+	defer done()
+
+	e.Pause()
+	first := "https://example.com/a"
+	second := "https://example.com/b"
+	third := "https://other.example.org/c"
+	e.Seed(first)
+	e.Seed(second)
+	e.Seed(third)
+
+	for _, rawURL := range []string{first, second} {
+		resp := postJSON(t, ts.URL+"/api/crawl/queue/drop", `{"url":"`+rawURL+`"}`)
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			t.Fatalf("drop %s status = %d, want 200", rawURL, resp.StatusCode)
+		}
+		resp.Body.Close()
+	}
+
+	var snap engine.QueueSnapshot
+	resp := getResp(t, ts.URL+"/api/crawl/queue")
+	decodeJSON(t, resp, &snap)
+	if len(snap.URLDrops) != 2 || snap.URLDrops[0].URL != second ||
+		snap.URLDrops[1].URL != first {
+		t.Fatalf("urlDrops = %+v, want %q then %q", snap.URLDrops, second, first)
+	}
+	if snap.LastURLDrop == nil || snap.LastURLDrop.URL != second {
+		t.Fatalf("lastUrlDrop = %+v, want %q", snap.LastURLDrop, second)
+	}
+
+	var restored struct {
+		Status   string `json:"status"`
+		URL      string `json:"url"`
+		Restored bool   `json:"restored"`
+	}
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/undo/url/select", `{"url":"HTTPS://EXAMPLE.COM/a/"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("selected undo status = %d, want 200", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &restored)
+	if restored.Status != "ok" || restored.URL != first || !restored.Restored {
+		t.Errorf("selected undo response = %+v, want ok, %q, and restored", restored, first)
+	}
+
+	snap = engine.QueueSnapshot{}
+	resp = getResp(t, ts.URL+"/api/crawl/queue")
+	decodeJSON(t, resp, &snap)
+	if len(snap.URLDrops) != 1 || snap.URLDrops[0].URL != second {
+		t.Fatalf("urlDrops after a selected undo = %+v, want only %q", snap.URLDrops, second)
+	}
+	if snap.LastURLDrop == nil || snap.LastURLDrop.URL != second {
+		t.Errorf("lastUrlDrop after a selected undo = %+v, want %q", snap.LastURLDrop, second)
+	}
+
+	var secondRestored struct {
+		Status   string `json:"status"`
+		URL      string `json:"url"`
+		Restored bool   `json:"restored"`
+	}
+	resp = postJSON(t, ts.URL+"/api/crawl/queue/undo/url/select", `{"url":"`+second+`"}`)
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		t.Fatalf("second selected undo status = %d, want 200", resp.StatusCode)
+	}
+	decodeJSON(t, resp, &secondRestored)
+	if secondRestored.URL != second || !secondRestored.Restored {
+		t.Errorf("second selected undo response = %+v, want %q and restored", secondRestored, second)
+	}
+
+	snap = engine.QueueSnapshot{}
+	resp = getResp(t, ts.URL+"/api/crawl/queue")
+	decodeJSON(t, resp, &snap)
+	if snap.Total != 3 || len(snap.URLDrops) != 0 || snap.LastURLDrop != nil {
+		t.Errorf("frontier after both undos = %+v, want 3 entries and no drops", snap)
+	}
+
+	for _, body := range []string{`{"url":"https://example.com/missing"}`, `{"url":""}`, `{}`, `not json`} {
+		resp = postJSON(t, ts.URL+"/api/crawl/queue/undo/url/select", body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("selected undo with %s = %d, want 400", body, resp.StatusCode)
+		}
+	}
+}
+
 func TestAPICrawlQueueURLUndoDiscard(t *testing.T) {
 	ts, e, done := newTestServerE(t)
 	defer done()

@@ -115,6 +115,10 @@
             </div>
           </div>
           <p id="frontierError" class="text-danger small mb-2 d-none"></p>
+          <div id="frontierUrlDrops" class="mb-3 d-none">
+            <p class="small text-secondary mb-1">Recent single URL drops</p>
+            <ul id="frontierUrlDropList" class="list-group list-group-flush small"></ul>
+          </div>
           <div id="frontierHosts" class="mb-3"></div>
           <ul id="frontierItems" class="list-group list-group-flush small"></ul>
           <p id="frontierEmpty" class="text-secondary small mb-0 d-none">The frontier is empty.</p>
@@ -304,6 +308,8 @@
     const frontierForget = document.getElementById('frontierForget');
     const frontierUndoUrl = document.getElementById('frontierUndoUrl');
     const frontierForgetUrl = document.getElementById('frontierForgetUrl');
+    const frontierUrlDrops = document.getElementById('frontierUrlDrops');
+    const frontierUrlDropList = document.getElementById('frontierUrlDropList');
 
     function showFrontierError(message) {
       frontierError.textContent = message;
@@ -336,6 +342,25 @@
         } else {
           frontierUndoUrl.textContent = 'Undo last URL';
         }
+
+        const urlDrops = data.urlDrops || [];
+        frontierUrlDrops.classList.toggle('d-none', urlDrops.length === 0);
+        frontierUrlDropList.textContent = '';
+        urlDrops.forEach(drop => {
+          const li = document.createElement('li');
+          li.className = 'list-group-item px-0 py-1 d-flex justify-content-between align-items-center gap-2';
+          const label = document.createElement('span');
+          label.className = 'text-break';
+          label.textContent = drop.url;
+          const undo = document.createElement('button');
+          undo.className = 'btn btn-sm btn-outline-warning flex-shrink-0';
+          undo.type = 'button';
+          undo.textContent = 'Undo';
+          undo.title = 'Restore this dropped URL';
+          undo.dataset.undoUrl = drop.url;
+          li.append(label, undo);
+          frontierUrlDropList.appendChild(li);
+        });
 
         frontierHosts.textContent = '';
         const hosts = Object.entries(data.hosts || {})
@@ -440,6 +465,12 @@
       const btn = e.target.closest('[data-queue-action]');
       if (!btn) return;
       runFrontierAction(btn.dataset.queueAction, btn.dataset.queueUrl);
+    });
+
+    frontierUrlDropList.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-undo-url]');
+      if (!btn) return;
+      runFrontierAction('undo/url/select', btn.dataset.undoUrl);
     });
 
     async function runFrontierHostAction(action, host) {

@@ -123,7 +123,8 @@ Tasks:
 - [x] Add a way to discard the remembered bulk drop without clearing the frontier.
 - [x] Add an undo for a single frontier URL drop.
 - [x] Persist the last single URL drop so its undo survives a restart.
-- [ ] Add an undo for a specific dropped URL selected by URL instead of only the most recent one.
+- [x] Add an undo for a specific dropped URL selected by URL instead of only the most recent one.
+- [ ] Add a way to discard a specific remembered URL drop instead of only the newest one.
 - [ ] Add a restart control for the crawler; pause and resume are already available.
 - [ ] Add per-domain crawl budgets and priority scheduling.
 - [ ] Add domain-level status and queue backlog display.
